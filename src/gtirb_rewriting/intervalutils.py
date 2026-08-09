@@ -21,6 +21,8 @@
 # endorsement should be inferred.
 import dataclasses
 import itertools
+import logging
+import time
 from typing import Iterable, List, Mapping, MutableMapping, Optional
 
 import gtirb
@@ -31,6 +33,11 @@ from ._adt import OffsetMapping
 from ._auxdata_offsetmap import OFFSETMAP_AUX_DATA_TABLES
 from .abi import ABI
 from .utils import align_address
+
+logger = logging.getLogger("gtirb_rewriting")
+
+_LARGE_INTERVAL_COUNT = 10_000
+_PROGRESS_INTERVAL = 100_000
 
 
 class PaddingError(Exception):
@@ -53,14 +60,16 @@ def split_byte_interval(
     interval: gtirb.ByteInterval,
     alignment: Optional[MutableMapping[gtirb.Node, int]] = None,
     tables: Optional[Iterable[OffsetMapping[object]]] = None,
+    isolated_blocks: Optional[Iterable[gtirb.ByteBlock]] = None,
 ) -> List[gtirb.ByteInterval]:
-    """Split a ByteInterval to put each block in its own interval.
+    """Split a ByteInterval into groups of blocks.
 
-    After the split, the original interval will hold the first block (ordered
-    by offset). Each remaining block will be in a new new byte interval. Any
-    bytes outside of a block will be included in the interval containing the
-    preceding block; the first interval will contain the bytes before and after
-    the first block.
+    By default, the original interval will hold the first block (ordered by
+    offset), and each remaining block will be in a new byte interval. When
+    ``isolated_blocks`` is provided, only those blocks are isolated;
+    consecutive unselected blocks remain together. Any bytes outside of a
+    block will be included in the interval containing the preceding block; the
+    first interval will contain the bytes before and after the first block.
 
     Because overlapping blocks share the bytes where they overlap, some
     intervals may contain more than one block after the split. These intervals
@@ -70,9 +79,25 @@ def split_byte_interval(
     :param interval:  byte interval to split
     :param alignment:  optional table of alignments for blocks and intervals
     :param tables:  optional collection of offset mappings to update
+    :param isolated_blocks:  optional blocks whose overlapping block groups
+        should be placed in separate intervals; other consecutive groups are
+        kept together unless an alignment boundary requires a split
     :returns:  list of byte intervals containing the blocks in the original
         interval
     """
+    started = time.perf_counter()
+    block_count = len(interval.blocks)
+    is_large = block_count >= _LARGE_INTERVAL_COUNT
+    section_name = interval.section.name if interval.section else "none"
+    if is_large:
+        logger.info(
+            "split: begin section=%s blocks=%d size=%d selected=%s",
+            section_name,
+            block_count,
+            interval.size,
+            "all" if isolated_blocks is None else "scoped",
+        )
+
     if tables is None:
         tables = []
         module = interval.module
@@ -84,13 +109,64 @@ def split_byte_interval(
 
     # Group overlapping blocks so they can be processed as a unit.
     groups: List[BlockGroup] = []
-    for block in sorted(interval.blocks, key=lambda b: b.offset):
+    sorted_blocks = sorted(interval.blocks, key=lambda b: b.offset)
+    if is_large:
+        logger.info(
+            "split: sorted %d blocks in %.1fs",
+            block_count,
+            time.perf_counter() - started,
+        )
+    for block_idx, block in enumerate(sorted_blocks, 1):
         block_end = block.offset + block.size
         if groups == [] or groups[-1].end <= block.offset:
             groups.append(BlockGroup(block.offset, block_end, [block]))
         else:
             groups[-1].end = max(groups[-1].end, block_end)
             groups[-1].blocks.append(block)
+        if is_large and block_idx % _PROGRESS_INTERVAL == 0:
+            logger.info(
+                "split: grouped %d/%d blocks into %d groups in %.1fs",
+                block_idx,
+                block_count,
+                len(groups),
+                time.perf_counter() - started,
+            )
+
+    if isolated_blocks is not None:
+        isolated_block_set = set(isolated_blocks)
+        if any(
+            block.byte_interval is not interval
+            for block in isolated_block_set
+        ):
+            raise ValueError("block is not part of the byte interval")
+
+        coalesced_groups: List[BlockGroup] = []
+        previous_is_isolated = False
+        for group in groups:
+            group_is_isolated = any(
+                block in isolated_block_set for block in group.blocks
+            )
+            group_starts_aligned = alignment is not None and any(
+                block in alignment for block in group.blocks
+            )
+            if (
+                coalesced_groups
+                and not previous_is_isolated
+                and not group_is_isolated
+                and not group_starts_aligned
+            ):
+                coalesced_groups[-1].end = group.end
+                coalesced_groups[-1].blocks.extend(group.blocks)
+            else:
+                coalesced_groups.append(group)
+            previous_is_isolated = group_is_isolated
+        groups = coalesced_groups
+        if is_large:
+            logger.info(
+                "split: coalesced to %d groups in %.1fs",
+                len(groups),
+                time.perf_counter() - started,
+            )
 
     # Process groups in decreasing offset order, but skip the first group
     # because it will stay in the original interval.
@@ -100,10 +176,13 @@ def split_byte_interval(
 
     # Create the new byte interval for each group of blocks.
     intervals: List[gtirb.ByteInterval] = []
-    offset = interval.size
-    for group in groups:
+    original_contents = interval.contents
+    original_size = interval.size
+    offset = original_size
+    group_count = len(groups)
+    for group_idx, group in enumerate(groups, 1):
         new_interval = gtirb.ByteInterval(
-            contents=interval.contents[group.begin :],
+            contents=original_contents[group.begin : offset],
             size=max(offset - group.begin, 0),
         )
         new_interval.section = interval.section
@@ -114,15 +193,30 @@ def split_byte_interval(
             block.byte_interval = new_interval
         intervals.append(new_interval)
 
-        offset = min(interval.size, group.begin)
-        interval.initialized_size = min(interval.initialized_size, offset)
-        interval.size = min(interval.size, offset)
+        offset = min(original_size, group.begin)
+        if is_large and group_idx % _PROGRESS_INTERVAL == 0:
+            logger.info(
+                "split: created %d/%d intervals in %.1fs",
+                group_idx,
+                group_count,
+                time.perf_counter() - started,
+            )
+    interval.initialized_size = min(len(original_contents), offset)
+    interval.size = min(original_size, offset)
     intervals.append(interval)
 
     # Transfer symbolic expressions and table items to the new intervals.
     symexprs = OffsetMapping()
     symexprs[interval] = dict(interval.symbolic_expressions)
-    for table in itertools.chain((symexprs,), tables):
+    for table_idx, table in enumerate(
+        itertools.chain((symexprs,), tables), 1
+    ):
+        if is_large:
+            logger.info(
+                "split: transferring offset table %d in %.1fs",
+                table_idx,
+                time.perf_counter() - started,
+            )
         items = sorted(table.get(interval, {}).items())
         for group, new_interval in zip(groups, intervals):
             while items != [] and items[-1][0] >= group.begin:
@@ -136,6 +230,13 @@ def split_byte_interval(
             new_interval.symbolic_expressions = symexprs[new_interval]
 
     intervals.reverse()
+    if is_large:
+        logger.info(
+            "split: complete section=%s intervals=%d in %.1fs",
+            section_name,
+            len(intervals),
+            time.perf_counter() - started,
+        )
     return intervals
 
 
@@ -181,13 +282,29 @@ def join_byte_intervals(
         specifies bytes for the default decode mode, they will supercede the
         bytes in the `nop` argument
     """
-    if len(intervals) < 2:
+    interval_count = len(intervals)
+    if interval_count < 2:
         return intervals[0]
+
+    started = time.perf_counter()
+    is_large = interval_count >= _LARGE_INTERVAL_COUNT
 
     nop_encodings = dict(nop_encodings) if nop_encodings else {}
     if nop is not None:
         nop_encodings.setdefault(gtirb.CodeBlock.DecodeMode.Default, nop)
 
+    destination = intervals[0]
+    section_name = (
+        destination.section.name if destination.section else "none"
+    )
+    if is_large:
+        logger.info(
+            "join: begin section=%s intervals=%d",
+            section_name,
+            interval_count,
+        )
+
+    source_table_entries = []
     if tables is None:
         # This is a bit hacky, but to avoid assuming that the byte intervals
         # are all in the same module, the tables are a list of dictionaries
@@ -197,16 +314,32 @@ def join_byte_intervals(
         # updated when modifying that sub-dict.
         tables = []
         for table_def in OFFSETMAP_AUX_DATA_TABLES:
+            if is_large:
+                logger.info(
+                    "join: scanning offset table %s across %d intervals "
+                    "in %.1fs",
+                    table_def.name,
+                    interval_count,
+                    time.perf_counter() - started,
+                )
             table = {}
             for bi in intervals:
                 if bi.module is not None:
                     aux_data = table_def.get(bi.module)
                     if aux_data and bi in aux_data:
                         table[bi] = aux_data[bi]
+                        if bi is not destination:
+                            source_table_entries.append((aux_data, bi))
             if len(table) > 0:
+                if destination not in table:
+                    assert destination.module is not None
+                    destination_data = table_def.get_or_insert(
+                        destination.module
+                    )
+                    destination_data[destination] = {}
+                    table[destination] = destination_data[destination]
                 tables.append(table)  # type: ignore # per above this is hacky
 
-    destination = intervals[0]
     intervals = intervals[1:]
 
     address = 0
@@ -215,6 +348,7 @@ def join_byte_intervals(
     address += destination.size
     last_block = max(destination.blocks, key=lambda b: b.offset, default=None)
     last_module = last_block.module if last_block is not None else None
+    contents = bytearray(destination.contents)
 
     def insert_padding(size):
         if size == 0:
@@ -233,18 +367,18 @@ def join_byte_intervals(
         else:
             pad_bytes = b"\x00"
 
-        destination.contents += pad_bytes * size
+        contents.extend(pad_bytes * size)
         # The pretty-printer won't print the padding bytes unless they
         # are contained in blocks, add a block covering anything not
         # yet covered by the last block.
         if last_block is not None:
             padding_block_offset = last_block.offset + last_block.size
             padding_block_size = (
-                len(destination.contents) - padding_block_offset
+                len(contents) - padding_block_offset
             )
         else:
             padding_block_offset = 0
-            padding_block_size = len(destination.contents)
+            padding_block_size = len(contents)
         if padding_block_size > 0:
             if isinstance(last_block, gtirb.CodeBlock):
                 padding = gtirb.CodeBlock(
@@ -260,9 +394,10 @@ def join_byte_intervals(
 
     symexprs = OffsetMapping()
     deltas = {}
-    for interval in intervals:
+    source_interval_count = len(intervals)
+    for interval_idx, interval in enumerate(intervals, 1):
         # Fill in any uninitialized bytes before appending.
-        insert_padding(destination.size - len(destination.contents))
+        insert_padding(destination.size - len(contents))
 
         # Align the first block if possible, or the interval if not.
         if alignment is not None:
@@ -293,8 +428,9 @@ def join_byte_intervals(
 
         # Cache the delta for updating the symbolic expression offsets and the
         # new last block in case we need more padding.
-        deltas[interval] = len(destination.contents)
-        symexprs[interval] = dict(interval.symbolic_expressions)
+        deltas[interval] = len(contents)
+        if interval.symbolic_expressions:
+            symexprs[interval] = dict(interval.symbolic_expressions)
         last_block = max(
             interval.blocks, default=last_block, key=lambda b: b.offset
         )
@@ -304,26 +440,79 @@ def join_byte_intervals(
         # Transfer the bytes and blocks to the new intervals.
         address += interval.size
         destination.size += interval.size
-        destination.contents += interval.contents
+        contents.extend(interval.contents)
         for block in tuple(interval.blocks):
             block.offset += deltas[interval]
             block.byte_interval = destination
 
         interval.initialized_size = 0
         interval.symbolic_expressions.clear()
+        if is_large and interval_idx % _PROGRESS_INTERVAL == 0:
+            logger.info(
+                "join: appended %d/%d intervals bytes=%d in %.1fs",
+                interval_idx,
+                source_interval_count,
+                len(contents),
+                time.perf_counter() - started,
+            )
 
-    destination.initialized_size = len(destination.contents)
+    if is_large:
+        logger.info(
+            "join: materializing %d content bytes in %.1fs",
+            len(contents),
+            time.perf_counter() - started,
+        )
+    destination.contents = bytes(contents)
+    destination.initialized_size = len(contents)
+    if is_large:
+        logger.info(
+            "join: content materialized in %.1fs",
+            time.perf_counter() - started,
+        )
 
     # Update offsets to refer to the destination interval.
-    for table in itertools.chain((symexprs,), tables):
-        for interval in intervals:
-            old = table.get(interval, {})
-            new_items = ((k + deltas[interval], v) for k, v in old.items())
-            if destination in table:
-                table[destination].update(new_items)
-            else:
-                table[destination] = dict(new_items)
-            old.clear()
+    for table_idx, table in enumerate(
+        itertools.chain((symexprs,), tables), 1
+    ):
+        if is_large:
+            logger.info(
+                "join: updating offset table %d in %.1fs",
+                table_idx,
+                time.perf_counter() - started,
+            )
+        destination_items = table.get(destination)
+        if destination_items is None:
+            destination_items = {}
+            table[destination] = destination_items
+        for interval_idx, interval in enumerate(intervals, 1):
+            old = table.get(interval)
+            if old:
+                destination_items.update(
+                    (k + deltas[interval], v) for k, v in old.items()
+                )
+            if interval in table:
+                del table[interval]
+            if is_large and interval_idx % _PROGRESS_INTERVAL == 0:
+                logger.info(
+                    "join: offset table %d processed %d/%d intervals "
+                    "in %.1fs",
+                    table_idx,
+                    interval_idx,
+                    source_interval_count,
+                    time.perf_counter() - started,
+                )
+    for table, interval in source_table_entries:
+        if interval in table:
+            del table[interval]
     destination.symbolic_expressions.update(symexprs[destination])
+
+    if is_large:
+        logger.info(
+            "join: complete section=%s intervals=%d bytes=%d in %.1fs",
+            section_name,
+            interval_count,
+            len(contents),
+            time.perf_counter() - started,
+        )
 
     return destination

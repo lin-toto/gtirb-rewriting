@@ -19,6 +19,7 @@
 # N68335-17-C-0700.  The content of the information does not necessarily
 # reflect the position or policy of the Government and no official
 # endorsement should be inferred.
+import contextlib
 import logging
 
 import gtirb
@@ -39,6 +40,7 @@ from gtirb_test_helpers import (
 from helpers import add_function_object, literal_patch
 
 import gtirb_rewriting
+import gtirb_rewriting.rewriting
 from gtirb_rewriting._auxdata import NULL_UUID
 
 
@@ -50,6 +52,104 @@ def dummy_patch(insertion_ctx):
     # This forces the start of a new block.
     .L_blah:
     """
+
+
+def capture_prepared_blocks(monkeypatch):
+    prepared_blocks = []
+    original_prepare = gtirb_rewriting.rewriting.prepare_for_rewriting
+
+    @contextlib.contextmanager
+    def capture(module, nop, blocks=None):
+        blocks = None if blocks is None else tuple(blocks)
+        prepared_blocks.append(None if blocks is None else set(blocks))
+        with original_prepare(module, nop, blocks):
+            yield
+
+    monkeypatch.setattr(
+        gtirb_rewriting.rewriting, "prepare_for_rewriting", capture
+    )
+    return prepared_blocks
+
+
+def test_prepare_all_blocks_by_default():
+    _, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    _, interval = add_text_section(module, address=0x1000)
+    add_code_block(interval, b"\x90")
+    add_code_block(interval, b"\x90")
+
+    with gtirb_rewriting.rewriting.prepare_for_rewriting(module, b"\x90"):
+        assert len(tuple(module.byte_intervals)) == 2
+
+    assert len(tuple(module.byte_intervals)) == 1
+
+
+def test_prepare_only_directly_targeted_blocks(monkeypatch):
+    _, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    _, target_interval = add_text_section(module, address=0x1000)
+    target = add_code_block(target_interval, b"\x90")
+    untouched_neighbor = add_code_block(target_interval, b"\x90")
+    _, untouched_interval = add_data_section(module, address=0x2000)
+    add_data_block(untouched_interval, b"\x00")
+
+    prepared_blocks = capture_prepared_blocks(monkeypatch)
+    ctx = gtirb_rewriting.RewritingContext(module, [])
+    ctx.insert_at(target, 0, literal_patch("nop"))
+    ctx.apply()
+
+    assert prepared_blocks == [{target}]
+    assert target_interval.contents == b"\x90\x90\x90"
+    assert untouched_neighbor.contents == b"\x90"
+    assert untouched_interval.contents == b"\x00"
+
+
+def test_prepare_only_declarative_scope_blocks(monkeypatch):
+    _, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    _, target_interval = add_text_section(module, address=0x1000)
+    target = add_code_block(target_interval, b"\x90")
+    target_function = add_function_object(module, "target", target)
+    _, untouched_interval = add_data_section(module, address=0x2000)
+    untouched = add_code_block(untouched_interval, b"\x90")
+    untouched_function = add_function_object(module, "untouched", untouched)
+
+    prepared_blocks = capture_prepared_blocks(monkeypatch)
+    ctx = gtirb_rewriting.RewritingContext(
+        module, [target_function, untouched_function]
+    )
+    ctx.register_insert(
+        gtirb_rewriting.AllFunctionsScope(
+            gtirb_rewriting.FunctionPosition.ENTRY,
+            gtirb_rewriting.BlockPosition.ENTRY,
+            {"target"},
+        ),
+        literal_patch("nop"),
+    )
+    ctx.apply()
+
+    assert prepared_blocks == [{target}]
+    assert target_interval.contents == b"\x90\x90"
+    assert untouched_interval.contents == b"\x90"
+
+
+def test_prepare_no_existing_blocks_for_function_insertion(monkeypatch):
+    _, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    add_text_section(module, address=0x1000)
+
+    prepared_blocks = capture_prepared_blocks(monkeypatch)
+    ctx = gtirb_rewriting.RewritingContext(module, [])
+    inserted = ctx.register_insert_function("inserted", literal_patch("ret"))
+    ctx.apply()
+
+    assert prepared_blocks == [set()]
+    assert inserted.referent is not None
+    assert inserted.referent.size == 1
 
 
 def test_multiple_insertions():
@@ -1342,6 +1442,12 @@ def test_logging(caplog):
 
         assert "nop" in caplog.text
         assert "ud2" in caplog.text
+        assert "apply: begin" in caplog.text
+        assert "apply: target resolution complete" in caplog.text
+        assert "prepare: split complete" in caplog.text
+        assert "apply: block application complete" in caplog.text
+        assert "prepare: rejoin complete" in caplog.text
+        assert "apply: complete" in caplog.text
 
 
 def test_functionless():

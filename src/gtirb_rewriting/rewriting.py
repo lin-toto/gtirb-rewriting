@@ -24,6 +24,7 @@ import dataclasses
 import itertools
 import logging
 import pathlib
+import time
 import uuid
 import warnings
 from collections import defaultdict
@@ -36,6 +37,7 @@ from typing import (
     NamedTuple,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Union,
     overload,
@@ -72,6 +74,10 @@ from .utils import (
 )
 
 logger = logging.getLogger("gtirb_rewriting")
+
+_BLOCK_SCAN_PROGRESS_INTERVAL = 100_000
+_MODIFIED_BLOCK_PROGRESS_INTERVAL = 25
+_MODIFICATION_PROGRESS_INTERVAL = 100
 
 
 class UnresolvableScopeError(ValueError):
@@ -127,6 +133,53 @@ class _ModificationStore:
                 self._block_changes[target].append(modification)
         else:
             self._scope_changes.append(modification)
+
+    def target_blocks(
+        self,
+        module: gtirb.Module,
+        functions: Sequence[gtirb_functions.Function],
+        progress_logger: logging.Logger = logger,
+    ) -> Optional[Set[gtirb.ByteBlock]]:
+        """Returns blocks that may change, or None if unresolved."""
+        blocks: Set[gtirb.ByteBlock] = set()
+        for block in self._block_changes:
+            if block.byte_interval is None:
+                return None
+            blocks.add(block)
+
+        if self._scope_changes:
+            started = time.perf_counter()
+            functions_by_block = {
+                block: func
+                for func in functions
+                for block in func.get_all_blocks()
+            }
+            scanned = 0
+            for scanned, block in enumerate(module.byte_blocks, 1):
+                func = functions_by_block.get(block)
+                if any(
+                    modification.scope._block_matches(module, func, block)
+                    for modification in self._scope_changes
+                ):
+                    if block.byte_interval is None:
+                        return None
+                    blocks.add(block)
+                if scanned % _BLOCK_SCAN_PROGRESS_INTERVAL == 0:
+                    progress_logger.info(
+                        "target resolution: scanned %d blocks, matched %d "
+                        "in %.1fs",
+                        scanned,
+                        len(blocks),
+                        time.perf_counter() - started,
+                    )
+            progress_logger.info(
+                "target resolution: complete after %d blocks, matched %d "
+                "in %.1fs",
+                scanned,
+                len(blocks),
+                time.perf_counter() - started,
+            )
+        return blocks
 
     def modifications_for_block(
         self,
@@ -641,11 +694,33 @@ class RewritingContext:
         Applies all of the patches that apply to a single block.
         """
 
+        started = time.perf_counter()
+        resolved_modifications = self._modifications.resolve_offsets(
+            block, self._decoder, modifications
+        )
+        if len(resolved_modifications) >= _MODIFICATION_PROGRESS_INTERVAL:
+            self._logger.info(
+                "apply block: address=%s modifications=%d",
+                hex(block.address) if block.address is not None else "unknown",
+                len(resolved_modifications),
+            )
+
         actual_block = block
         total_insert_len = 0
-        for modification, offset in self._modifications.resolve_offsets(
-            block, self._decoder, modifications
+        for modification_idx, (modification, offset) in enumerate(
+            resolved_modifications, 1
         ):
+            if modification_idx % _MODIFICATION_PROGRESS_INTERVAL == 0:
+                self._logger.info(
+                    "apply block: address=%s applied %d/%d modifications "
+                    "in %.1fs",
+                    hex(block.address)
+                    if block.address is not None
+                    else "unknown",
+                    modification_idx,
+                    len(resolved_modifications),
+                    time.perf_counter() - started,
+                )
             assert isinstance(actual_block, gtirb.ByteBlock)
 
             block_delta = actual_block.offset - block.offset
@@ -1084,52 +1159,164 @@ class RewritingContext:
 
         assert self._module.ir
 
+        apply_started = time.perf_counter()
+        self._logger.info(
+            "apply: begin direct target blocks=%d unresolved scopes=%d "
+            "function insertions=%d",
+            len(self._modifications._block_changes),
+            len(self._modifications._scope_changes),
+            len(self._function_insertions),
+        )
+
+        phase_started = time.perf_counter()
+        target_blocks = self._modifications.target_blocks(
+            self._module, self._functions, self._logger
+        )
+        self._logger.info(
+            "apply: target resolution complete targets=%s in %.1fs",
+            "all" if target_blocks is None else len(target_blocks),
+            time.perf_counter() - phase_started,
+        )
+
         with prepare_for_rewriting(
-            self._module, self._abi.nop()
-        ), make_modify_cache(self._module, self._functions) as modify_cache:
-            functions_by_uuid = {func.uuid: func for func in self._functions}
-            sorted_blocks = sorted(
-                self._module.byte_blocks, key=lambda b: b.address or 0
+            self._module, self._abi.nop(), target_blocks
+        ):
+            self._logger.info(
+                "apply: interval preparation entered after %.1fs",
+                time.perf_counter() - apply_started,
+            )
+            phase_started = time.perf_counter()
+            self._logger.info("apply: building modify cache")
+            with make_modify_cache(
+                self._module, self._functions
+            ) as modify_cache:
+                self._logger.info(
+                    "apply: modify cache ready in %.1fs",
+                    time.perf_counter() - phase_started,
+                )
+
+                functions_by_uuid = {
+                    func.uuid: func for func in self._functions
+                }
+                phase_started = time.perf_counter()
+                self._logger.info("apply: sorting blocks")
+                sorted_blocks = sorted(
+                    self._module.byte_blocks, key=lambda b: b.address or 0
+                )
+                self._logger.info(
+                    "apply: sorted %d blocks in %.1fs",
+                    len(sorted_blocks),
+                    time.perf_counter() - phase_started,
+                )
+
+                for func in self._function_insertions:
+                    self._insert_function_stub(
+                        modify_cache, func.symbol, func.block
+                    )
+
+                for func in self._function_insertions:
+                    self._apply_function_insertion(
+                        modify_cache, func.symbol, func.block, func.patch
+                    )
+
+                phase_started = time.perf_counter()
+                self._logger.info("apply: building CFI procedure index")
+                cfi_tracker = _CFIProcedureTracker(
+                    self._module, sorted_blocks
+                )
+                self._logger.info(
+                    "apply: CFI procedure index ready in %.1fs",
+                    time.perf_counter() - phase_started,
+                )
+
+                phase_started = time.perf_counter()
+                modified_blocks = 0
+                for idx, block in enumerate(sorted_blocks):
+                    if (
+                        idx > 0
+                        and idx % _BLOCK_SCAN_PROGRESS_INTERVAL == 0
+                    ):
+                        self._logger.info(
+                            "apply: scanned %d/%d blocks, modified %d in "
+                            "%.1fs",
+                            idx,
+                            len(sorted_blocks),
+                            modified_blocks,
+                            time.perf_counter() - phase_started,
+                        )
+
+                    func = None
+                    if isinstance(block, gtirb.CodeBlock):
+                        func_uuid = modify_cache.functions_by_block.get(block)
+                        if func_uuid:
+                            func = functions_by_uuid.get(func_uuid)
+
+                    modifications = (
+                        self._modifications.modifications_for_block(
+                            self._module, block, func
+                        )
+                    )
+                    if not modifications:
+                        continue
+
+                    modified_blocks += 1
+                    if (
+                        modified_blocks
+                        % _MODIFIED_BLOCK_PROGRESS_INTERVAL
+                        == 0
+                    ):
+                        self._logger.info(
+                            "apply: applying modified block %d at sorted "
+                            "index %d/%d after %.1fs",
+                            modified_blocks,
+                            idx,
+                            len(sorted_blocks),
+                            time.perf_counter() - phase_started,
+                        )
+
+                    self._apply_modifications(
+                        modify_cache,
+                        modifications,
+                        func,
+                        block,
+                        lambda offset, idx=idx: cfi_tracker.in_procedure(
+                            idx, offset
+                        ),
+                    )
+
+                self._logger.info(
+                    "apply: block application complete scanned=%d "
+                    "modified=%d in %.1fs",
+                    len(sorted_blocks),
+                    modified_blocks,
+                    time.perf_counter() - phase_started,
+                )
+                self._logger.info("apply: exiting modify cache")
+
+            self._logger.info(
+                "apply: modify cache exited after %.1fs",
+                time.perf_counter() - apply_started,
             )
 
-            for func in self._function_insertions:
-                self._insert_function_stub(
-                    modify_cache, func.symbol, func.block
-                )
-
-            for func in self._function_insertions:
-                self._apply_function_insertion(
-                    modify_cache, func.symbol, func.block, func.patch
-                )
-
-            cfi_tracker = _CFIProcedureTracker(self._module, sorted_blocks)
-            for idx, block in enumerate(sorted_blocks):
-                func = None
-                if isinstance(block, gtirb.CodeBlock):
-                    func_uuid = modify_cache.functions_by_block.get(block)
-                    if func_uuid:
-                        func = functions_by_uuid.get(func_uuid)
-
-                modifications = self._modifications.modifications_for_block(
-                    self._module, block, func
-                )
-                if not modifications:
-                    continue
-
-                self._apply_modifications(
-                    modify_cache,
-                    modifications,
-                    func,
-                    block,
-                    lambda offset, idx=idx: cfi_tracker.in_procedure(
-                        idx, offset
-                    ),
-                )
+        self._logger.info(
+            "apply: interval preparation exited after %.1fs",
+            time.perf_counter() - apply_started,
+        )
 
         if self._symbol_retargets:
+            self._logger.info(
+                "apply: retargeting %d symbols", len(self._symbol_retargets)
+            )
             retarget_symbol_uses(
                 self._module, self._symbol_retargets, self._decoder
             )
 
         if self._symbol_deletions:
+            self._logger.info(
+                "apply: deleting %d symbols", len(self._symbol_deletions)
+            )
             delete_symbols(self._module, self._symbol_deletions)
+
+        self._logger.info(
+            "apply: complete in %.1fs", time.perf_counter() - apply_started
+        )

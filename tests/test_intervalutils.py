@@ -19,10 +19,13 @@
 # N68335-17-C-0700.  The content of the information does not necessarily
 # reflect the position or policy of the Government and no official
 # endorsement should be inferred.
+import logging
+
 import gtirb
 import pytest
 
 import gtirb_rewriting
+import gtirb_rewriting.intervalutils
 
 
 def test_split_byte_interval_no_tables():
@@ -67,6 +70,27 @@ def test_split_byte_interval_no_tables():
         3: gtirb.SymAddrAddr(symbol1=s1, symbol2=s2, scale=1, offset=0),
     }
     assert b2.offset == 0
+
+
+def test_large_interval_progress_logging(caplog, monkeypatch):
+    blocks = [gtirb.CodeBlock(offset=i, size=1) for i in range(3)]
+    interval = gtirb.ByteInterval(contents=b"abc", blocks=blocks)
+
+    monkeypatch.setattr(
+        gtirb_rewriting.intervalutils, "_LARGE_INTERVAL_COUNT", 2
+    )
+    monkeypatch.setattr(
+        gtirb_rewriting.intervalutils, "_PROGRESS_INTERVAL", 1
+    )
+
+    with caplog.at_level(logging.INFO, logger="gtirb_rewriting"):
+        split = gtirb_rewriting.split_byte_interval(interval)
+        gtirb_rewriting.join_byte_intervals(split)
+
+    assert "split: begin" in caplog.text
+    assert "split: complete" in caplog.text
+    assert "join: begin" in caplog.text
+    assert "join: complete" in caplog.text
 
 
 def test_split_byte_interval_default_tables():
@@ -204,6 +228,45 @@ def test_split_byte_interval_overlapping_blocks():
     assert b7.offset == 1
 
     assert alignment == {b3: 4, b4: 4}
+
+
+def test_split_byte_interval_isolates_selected_blocks():
+    blocks = [gtirb.DataBlock(offset=i, size=1) for i in range(5)]
+    bi = gtirb.ByteInterval(address=1, contents=b"abcde", blocks=blocks)
+
+    intervals = gtirb_rewriting.split_byte_interval(
+        bi,
+        alignment={blocks[3]: 4},
+        isolated_blocks={blocks[1]},
+    )
+
+    assert [interval.contents for interval in intervals] == [
+        b"a",
+        b"b",
+        b"c",
+        b"de",
+    ]
+    assert [interval.blocks for interval in intervals] == [
+        {blocks[0]},
+        {blocks[1]},
+        {blocks[2]},
+        {blocks[3], blocks[4]},
+    ]
+    assert intervals[3].address == 4
+    assert blocks[3].offset == 0
+    assert blocks[4].offset == 1
+
+
+def test_split_byte_interval_uninitialized_contents():
+    b1 = gtirb.DataBlock(offset=0, size=2)
+    b2 = gtirb.DataBlock(offset=3, size=2)
+    bi = gtirb.ByteInterval(contents=b"ab", size=5, blocks=[b1, b2])
+
+    intervals = gtirb_rewriting.split_byte_interval(bi)
+
+    assert [interval.contents for interval in intervals] == [b"ab", b""]
+    assert [interval.size for interval in intervals] == [3, 2]
+    assert [interval.initialized_size for interval in intervals] == [2, 0]
 
 
 def test_join_byte_intervals_no_tables():
@@ -392,12 +455,39 @@ def test_join_byte_intervals_default_tables():
     assert comments[gtirb.Offset(bi1, 0)] == "x"
     assert comments[gtirb.Offset(bi1, 5)] == "y"
     assert comments[gtirb.Offset(bi3, 2)] == "z"
+    assert bi2 not in comments
 
     padding = m.aux_data["padding"].data
     assert len(padding) == 3
     assert padding[gtirb.Offset(bi1, 1)] == 0
     assert padding[gtirb.Offset(bi1, 4)] == 1
     assert padding[gtirb.Offset(bi3, 0)] == 2
+    assert bi2 not in padding
+
+
+def test_join_byte_intervals_default_table_without_destination_entry():
+    b1 = gtirb.CodeBlock(offset=0, size=2)
+    b2 = gtirb.CodeBlock(offset=0, size=2)
+    bi1 = gtirb.ByteInterval(blocks=[b1], contents=b"\x00\x01")
+    bi2 = gtirb.ByteInterval(blocks=[b2], contents=b"\x02\x03")
+    s = gtirb.Section(name=".test", byte_intervals=[bi1, bi2])
+    m = gtirb.Module(
+        name="test",
+        sections=[s],
+        isa=gtirb.Module.ISA.X64,
+        file_format=gtirb.Module.FileFormat.ELF,
+    )
+
+    m.aux_data["comments"] = gtirb.AuxData(
+        type_name="mapping<Offset,string>",
+        data={gtirb.Offset(element_id=bi2, displacement=1): "x"},
+    )
+
+    gtirb_rewriting.join_byte_intervals([bi1, bi2])
+
+    comments = m.aux_data["comments"].data
+    assert comments == {gtirb.Offset(bi1, 3): "x"}
+    assert bi2 not in comments
 
 
 def test_join_byte_intervals_custom_tables():
@@ -438,6 +528,7 @@ def test_join_byte_intervals_custom_tables():
     assert table[gtirb.Offset(bi1, 1)] == 0
     assert table[gtirb.Offset(bi1, 2)] == 1
     assert table[gtirb.Offset(bi3, 0)] == 2
+    assert bi2 not in table
 
 
 def test_join_byte_intervals_bad_padding():
