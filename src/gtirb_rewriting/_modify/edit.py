@@ -530,9 +530,15 @@ def edit_byte_interval(
     size_delta = len(content) - length
 
     bi.size += size_delta
-    bi.contents = (
-        bi.contents[:offset] + content + bi.contents[offset + length :]
-    )
+    # ByteInterval initializes contents as a bytearray, though callers can
+    # assign an immutable bytes object later.  Normalize that uncommon case
+    # once, then update in place so a sequence of edits does not copy the
+    # entire interval for every insertion.  Large rewritten blocks can contain
+    # thousands of edits, making the previous slice-and-concatenate form
+    # quadratic in the interval size.
+    if not isinstance(bi.contents, bytearray):
+        bi.contents = bytearray(bi.contents)
+    bi.contents[offset : offset + length] = content
 
     # adjust blocks that occur after the insertion point
     # TODO: what if blocks overlap over the insertion point?

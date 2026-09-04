@@ -1153,8 +1153,11 @@ def test_edit_byte_interval_simple():
     m.aux_data["comments"].data[gtirb.Offset(bi, 0)] = "0"
     m.aux_data["comments"].data[gtirb.Offset(bi, 2)] = "2"
 
+    original_contents = bi.contents
+
     gtirb_rewriting._modify.edit_byte_interval(bi, 2, 0, b"\x90\x90", {b2})
 
+    assert bi.contents is original_contents
     assert bi.contents == b"\xE8\x00\x90\x90\xE8\x00"
     assert bi.size == 6
 
@@ -1209,3 +1212,20 @@ def test_edit_byte_interval_replace():
     assert m.aux_data["comments"].data == {
         gtirb.Offset(bi, 0): "2",
     }
+
+
+def test_edit_byte_interval_normalizes_immutable_contents():
+    _, m = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    _, bi = add_text_section(m, address=0x1000)
+    block = add_code_block(bi, b"\x90\x90")
+    bi.contents = bytes(bi.contents)
+
+    gtirb_rewriting._modify.edit_byte_interval(
+        bi, 1, 0, b"\xCC", {block}
+    )
+
+    assert isinstance(bi.contents, bytearray)
+    assert bi.contents == b"\x90\xCC\x90"
+    assert bi.size == 3
