@@ -64,7 +64,12 @@ from .abi import ABI
 from .assembler import AsmSyntaxError, Assembler
 from .patch import InsertionContext, Patch
 from .prepare import prepare_for_rewriting
-from .scopes import Scope, _SpecificLocationScope
+from .scopes import (
+    AllBlocksScope,
+    AllFunctionsScope,
+    Scope,
+    _SpecificLocationScope,
+)
 from .utils import (
     _block_fallthrough_targets,
     _is_partial_disassembly,
@@ -141,6 +146,14 @@ class _ModificationStore:
         progress_logger: logging.Logger = logger,
     ) -> Optional[Set[gtirb.ByteBlock]]:
         """Returns blocks that may change, or None if unresolved."""
+        # Custom predicates may require assigned addresses, resolved integral
+        # symbols, or isolated intervals. Do not evaluate them before prepare.
+        if any(
+            type(modification.scope) not in (AllBlocksScope, AllFunctionsScope)
+            for modification in self._scope_changes
+        ):
+            return None
+
         blocks: Set[gtirb.ByteBlock] = set()
         for block in self._block_changes:
             if block.byte_interval is None:

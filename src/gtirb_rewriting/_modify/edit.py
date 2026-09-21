@@ -170,6 +170,10 @@ def delete(
     if length == 0 and block.size != 0:
         return block
 
+    _validate_edit_boundaries(
+        bi, block.offset + offset, length, -length, {block}
+    )
+
     if length != block.size:
         start, end, _ = split_block(cache, block, offset)
         mid, end, _ = split_block(cache, end, length)
@@ -245,6 +249,14 @@ def insert(
     bi = block.byte_interval
     module = block.module
     cfg = block.ir.cfg
+
+    _validate_edit_boundaries(
+        bi,
+        block.offset + offset,
+        replacement_length,
+        len(text_section.data) - replacement_length,
+        {block},
+    )
 
     _add_return_edges_for_patch_calls(
         cache,
@@ -508,6 +520,29 @@ def _add_other_section_contents(
     encodings_table.update(sect.block_types.items())
 
 
+def _validate_edit_boundaries(
+    bi: gtirb.ByteInterval,
+    offset: int,
+    length: int,
+    size_delta: int,
+    static_blocks: Container[gtirb.ByteBlock],
+) -> None:
+    if not length or not size_delta:
+        return
+
+    end = offset + length
+    for block in bi.blocks:
+        if block in static_blocks:
+            continue
+        if (
+            offset < block.offset < end
+            or offset < block.offset + block.size < end
+        ):
+            raise AmbiguousIRError(
+                "Size-changing edit would erase an overlapping block boundary"
+            )
+
+
 def edit_byte_interval(
     bi: gtirb.ByteInterval,
     offset: int,
@@ -517,17 +552,20 @@ def edit_byte_interval(
 ) -> None:
     """
     Edits a byte interval's contents, moving blocks, symbolic expressions, and
-    aux data as needed.
+    aux data as needed. Blocks spanning an edit are resized; size-changing
+    replacements that erase another block's boundary are rejected.
     :param bi: The byte interval to edit.
     :param offset: The offset in the byte interval to insert at.
     :param length: The number of bytes in the byte interval to overwrite.
     :param content: The content to insert.
-    :param static_blocks: Blocks whose offsets should not be updated.
+    :param static_blocks: Blocks whose offsets and sizes are managed by the
+                          caller and should not be updated.
     """
 
     assert bi.module, "byte interval must be in a module"
 
     size_delta = len(content) - length
+    _validate_edit_boundaries(bi, offset, length, size_delta, static_blocks)
 
     bi.size += size_delta
     # ByteInterval initializes contents as a bytearray, though callers can
@@ -538,13 +576,21 @@ def edit_byte_interval(
     # quadratic in the interval size.
     if not isinstance(bi.contents, bytearray):
         bi.contents = bytearray(bi.contents)
+    # A slice past the initialized prefix would otherwise append at its end,
+    # ignoring the requested offset in the interval's uninitialized tail.
+    if content and offset > len(bi.contents):
+        bi.contents.extend(bytearray(offset - len(bi.contents)))
     bi.contents[offset : offset + length] = content
 
-    # adjust blocks that occur after the insertion point
-    # TODO: what if blocks overlap over the insertion point?
+    # Insertion at a block's start precedes it, while a replacement starting
+    # there is part of the block. Interior edits keep both extents consistent.
     for b in bi.blocks:
-        if b.offset >= offset and b not in static_blocks:
+        if b in static_blocks:
+            continue
+        if b.offset >= offset + length:
             b.offset += size_delta
+        elif b.offset + b.size > offset:
+            b.size += size_delta
 
     # adjust sym exprs that occur after the insertion point
     bi.symbolic_expressions = {

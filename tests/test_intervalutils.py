@@ -407,6 +407,30 @@ def test_join_byte_intervals_decode_mode_padding():
     assert b3.address == 0x10C
 
 
+def test_join_byte_intervals_preserves_mutable_contents():
+    first = gtirb.ByteInterval(contents=b"a")
+    second = gtirb.ByteInterval(contents=b"b")
+    joined = gtirb_rewriting.join_byte_intervals([first, second])
+    joined.contents[1] = ord("c")
+    assert joined.contents == b"ac"
+
+
+def test_join_byte_intervals_removes_empty_offset_buckets():
+    first = gtirb.ByteInterval(contents=b"a")
+    second = gtirb.ByteInterval(contents=b"b")
+    section = gtirb.Section(byte_intervals=[first, second])
+    module = gtirb.Module(name="empty-offset-buckets", sections=[section])
+    comments = gtirb_rewriting.OffsetMapping({gtirb.Offset(second, 0): "x"})
+    del comments[gtirb.Offset(second, 0)]
+    assert second in comments
+    assert not comments
+    module.aux_data["comments"] = gtirb.AuxData(
+        comments, "mapping<Offset,string>"
+    )
+    gtirb_rewriting.join_byte_intervals([first, second])
+    assert second not in comments
+
+
 def test_join_byte_intervals_default_tables():
     b1 = gtirb.CodeBlock(offset=0, size=2)
     b2 = gtirb.CodeBlock(offset=0, size=2)

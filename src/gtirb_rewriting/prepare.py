@@ -33,11 +33,51 @@ from gtirb_layout import (
 
 import gtirb_rewriting._auxdata as _auxdata
 
+from ._riscv_pcrel import RiscvPcrelPairs
 from .intervalutils import join_byte_intervals, split_byte_interval
 
 logger = logging.getLogger("gtirb_rewriting")
 
 _INTERVAL_PROGRESS_INTERVAL = 100
+_SHN_ABS = 0xFFF1
+
+
+@contextlib.contextmanager
+def _preserve_absolute_symbols(module: gtirb.Module) -> Iterator[None]:
+    # gtirb-layout 1.x does not distinguish SHN_ABS values from addresses.
+    # Hide only their numeric payload while that dependency assigns referents;
+    # patch generation must continue to see the original values.
+    info = _auxdata.elf_symbol_info.get(module) or {}
+    values = {
+        symbol: symbol.value
+        for symbol, attributes in info.items()
+        if symbol.module is module
+        and symbol.value is not None
+        and attributes[4] == _SHN_ABS
+    }
+    for symbol in values:
+        symbol.value = None
+    try:
+        yield
+    finally:
+        for symbol, value in values.items():
+            symbol.value = value
+
+
+def _assign_integral_symbols(module: gtirb.Module) -> None:
+    with _preserve_absolute_symbols(module):
+        assign_integral_symbols(module)
+    if module.file_format != gtirb.Module.FileFormat.ELF:
+        return
+    info = _auxdata.elf_symbol_info.get_or_insert(module)
+    for symbol in module.symbols:
+        if symbol.value is not None:
+            attributes = info.get(symbol, (0, "NOTYPE", "LOCAL", "DEFAULT", 0))
+            # An inferred local value without section provenance must not bind
+            # to an unrelated interval after layout. Keep real section indices
+            # and undefined external bindings intact, even outside byte extents.
+            if attributes[4] == 0 and attributes[2] == "LOCAL":
+                info[symbol] = (*attributes[:4], _SHN_ABS)
 
 
 def _should_log_interval(index: int, total: int) -> bool:
@@ -71,12 +111,13 @@ def prepare_for_rewriting(
     )
 
     phase_started = time.perf_counter()
+    logger.info("prepare: assigning integral symbols")
+    _assign_integral_symbols(module)
+    pcrel_pairs = RiscvPcrelPairs(module)
     if is_module_layout_required(module):
         logger.info("prepare: laying out input module")
-        layout_module(module)
-    else:
-        logger.info("prepare: assigning integral symbols")
-        assign_integral_symbols(module)
+        with _preserve_absolute_symbols(module):
+            layout_module(module)
     logger.info(
         "prepare: input layout ready in %.1fs",
         time.perf_counter() - phase_started,
@@ -169,10 +210,13 @@ def prepare_for_rewriting(
         time.perf_counter() - phase_started,
     )
 
+    pcrel_pairs.restore()
     if is_module_layout_required(module):
         phase_started = time.perf_counter()
         logger.info("prepare: laying out rewritten module")
-        layout_module(module)
+        _assign_integral_symbols(module)
+        with _preserve_absolute_symbols(module):
+            layout_module(module)
         logger.info(
             "prepare: rewritten module layout complete in %.1fs",
             time.perf_counter() - phase_started,

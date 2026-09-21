@@ -136,6 +136,86 @@ def test_prepare_only_declarative_scope_blocks(monkeypatch):
     assert untouched_interval.contents == b"\x90"
 
 
+@pytest.mark.parametrize("needs_layout", [False, True])
+def test_custom_scope_sees_prepared_state(monkeypatch, needs_layout):
+    _, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    _, interval = add_text_section(module, address=0x1000)
+    first = add_code_block(interval, b"\x90")
+    second = add_code_block(interval, b"\x90")
+    if needs_layout:
+        interval.address = None
+        integral = None
+    else:
+        integral = add_symbol(module, "integral", first.address)
+    visited = []
+
+    class PreparedScope(gtirb_rewriting.AllBlocksScope):
+        def _block_matches(self, module, func, block):
+            assert block.address is not None
+            if integral is not None:
+                assert integral.referent is first
+            assert len(block.byte_interval.blocks) == 1
+            visited.append(block)
+            return super()._block_matches(module, func, block)
+
+    prepared_blocks = capture_prepared_blocks(monkeypatch)
+    ctx = gtirb_rewriting.RewritingContext(module, [])
+    ctx.register_insert(
+        PreparedScope(gtirb_rewriting.BlockPosition.ENTRY), literal_patch("int3")
+    )
+    ctx.apply()
+
+    assert prepared_blocks == [None]
+    assert visited == [first, second]
+    assert interval.contents == b"\xCC\x90\xCC\x90"
+
+
+def test_insert_inside_overlapping_blocks():
+    _, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    _, interval = add_data_section(module, address=0x1000)
+    primary = add_data_block(interval, b"abcdefgh")
+    alias = gtirb.DataBlock(offset=2, size=4, byte_interval=interval)
+    end_symbol = add_symbol(module, "alias_end", alias)
+    end_symbol.at_end = True
+
+    ctx = gtirb_rewriting.RewritingContext(module, [])
+    ctx.insert_at(primary, 3, b"XY")
+    ctx.apply()
+
+    assert interval.contents == b"abcXYdefgh"
+    assert alias.contents == b"cXYdef"
+    assert end_symbol.referent.address + end_symbol.referent.size == 0x1008
+
+
+@pytest.mark.parametrize("delete", [False, True])
+def test_ambiguous_edit_does_not_split_blocks(delete):
+    _, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    _, interval = add_text_section(module, address=0x1000)
+    primary = add_code_block(interval, b"\x90" * 8)
+    alias = gtirb.DataBlock(offset=4, size=2, byte_interval=interval)
+    symbol = add_symbol(module, "alias", alias)
+
+    ctx = gtirb_rewriting.RewritingContext(module, [])
+    if delete:
+        ctx.delete_at(primary, 3, 2)
+    else:
+        ctx.replace_at(primary, 3, 2, literal_patch("nop"))
+    with pytest.raises(gtirb_rewriting._modify.AmbiguousIRError):
+        ctx.apply()
+
+    assert interval.contents == b"\x90" * 8
+    assert set(interval.blocks) == {primary, alias}
+    assert (primary.offset, primary.size) == (0, 8)
+    assert (alias.offset, alias.size) == (4, 2)
+    assert symbol.referent is alias
+
+
 def test_prepare_no_existing_blocks_for_function_insertion(monkeypatch):
     _, module = create_test_module(
         gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
@@ -1669,6 +1749,48 @@ def test_layout_before_integral_symbol():
     assert integral_sym.referent is b2
     assert not integral_sym.at_end
     assert bi.contents == b"\x90\x90\x90"
+
+
+@pytest.mark.parametrize("value, absolute", [(0, False), (0x1000, True)])
+def test_repeated_layout_preserves_absolute_symbols(tmp_path, value, absolute):
+    ir, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    _, interval = add_text_section(module, address=0x1000)
+    block = add_code_block(interval, b"\x90")
+    add_symbol(module, "entry", block)
+    constant = add_symbol(module, "constant", value)
+    movable = add_symbol(module, "movable", block.address)
+    section_relative = add_symbol(module, "section_relative", 0x3000)
+    module.aux_data["elfSymbolInfo"].data[section_relative] = (
+        0, "NOTYPE", "GLOBAL", "DEFAULT", 1
+    )
+    if absolute:
+        module.aux_data["elfSymbolInfo"].data[constant] = (
+            0, "NOTYPE", "LOCAL", "DEFAULT", 0xFFF1
+        )
+
+    for iteration in range(3):
+        block = next(module.symbols_named("entry")).referent
+        context = gtirb_rewriting.RewritingContext(module, [])
+        context.insert_at(block, 0, literal_patch("nop"))
+        context.apply()
+        constant = next(module.symbols_named("constant"))
+        movable = next(module.symbols_named("movable"))
+        assert constant.value == value
+        assert constant.referent is None
+        assert movable.referent is not None
+        section_relative = next(module.symbols_named("section_relative"))
+        assert module.aux_data["elfSymbolInfo"].data[section_relative][-1] == 1
+
+        # Absolute identity must survive serialization, not only a cache on the
+        # first RewritingContext or Symbol object.
+        path = tmp_path / f"round-{iteration}.gtirb"
+        ir.save_protobuf(path)
+        ir = gtirb.IR.load_protobuf(path)
+        module = ir.modules[0]
+    constant = next(module.symbols_named("constant"))
+    assert module.aux_data["elfSymbolInfo"].data[constant][-1] == 0xFFF1
 
 
 def test_layout_after():

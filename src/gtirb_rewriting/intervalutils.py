@@ -326,7 +326,7 @@ def join_byte_intervals(
             for bi in intervals:
                 if bi.module is not None:
                     aux_data = table_def.get(bi.module)
-                    if aux_data and bi in aux_data:
+                    if aux_data is not None and bi in aux_data:
                         table[bi] = aux_data[bi]
                         if bi is not destination:
                             source_table_entries.append((aux_data, bi))
@@ -462,7 +462,7 @@ def join_byte_intervals(
             len(contents),
             time.perf_counter() - started,
         )
-    destination.contents = bytes(contents)
+    destination.contents = contents
     destination.initialized_size = len(contents)
     if is_large:
         logger.info(

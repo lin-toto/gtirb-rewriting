@@ -1237,9 +1237,12 @@ def test_fill():
     (
         gtirb.Module.ISA.X64,
         gtirb.Module.ISA.MIPS32,
+        gtirb.Module.ISA.ARM64,
     ),
 )
-def test_sym_minus_sym(isa: gtirb.Module.ISA):
+@pytest.mark.parametrize("scale", (1, 2, 4))
+@pytest.mark.parametrize("offset", (0, 3, -3))
+def test_sym_minus_sym(isa: gtirb.Module.ISA, scale: int, offset: int):
     _, m = create_test_module(
         gtirb.Module.FileFormat.ELF,
         isa,
@@ -1249,9 +1252,9 @@ def test_sym_minus_sym(isa: gtirb.Module.ISA):
 
     assembler = gtirb_rewriting.Assembler(m)
     assembler.assemble(
-        """
+        f"""
         .data
-        .byte foo - foo2
+        .byte (foo - foo2) / {scale} {offset:+d}
         """,
         gtirb_rewriting.X86Syntax.ATT,
     )
@@ -1261,7 +1264,7 @@ def test_sym_minus_sym(isa: gtirb.Module.ISA):
     assert result.sections[".data"].data == b"\x00"
     assert result.sections[".data"].symbolic_expressions[
         0
-    ] == gtirb.SymAddrAddr(1, 0, foo, foo2)
+    ] == gtirb.SymAddrAddr(scale, offset, foo, foo2)
 
 
 def test_assignments():

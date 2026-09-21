@@ -28,6 +28,18 @@ transform from scratch.
 
 ## Design
 
+RISC-V preparation preserves the identity of existing AUIPC/PCREL_LO pairs
+through interval edits. Existing pairs receive dedicated low-relocation anchors
+without moving public entry labels or sharing their symbol retargeting. Removing or changing a high
+instruction while keeping its old low relocation raises an error; replace both
+relocations and supply an explicit new instruction anchor when intentionally
+changing a pair. Replacing only the LO expression object does not bypass
+validation: an existing anchor must still name its original producer. Ordinary
+GTIRB symbols carry the repaired anchors across serialization, with no
+additional auxdata table.
+This does not add a RISC-V ABI; clients still supply their RISC-V compatibility
+support. Input pairs must already identify the correct instructions.
+
 A `Pass` registers changes to be made in a module with the `RewritingContext`
 passed to `begin_module`.
 
@@ -65,10 +77,31 @@ A pass may optionally be called back after all patches have been applied with
 the `end_module` method. This provides an opportunity to do per-module work,
 such as writing an edge map for a profiling pass.
 
+Preparation resolves input layout and integral symbols before custom scope
+predicates run. Direct targets and built-in scopes can limit interval splitting
+to the affected blocks; custom predicates use full preparation.
+ELF absolute symbols retain their values across rounds. Inferred local values
+without section provenance that lie outside the input image are recorded as
+`SHN_ABS` in `elfSymbolInfo`, preventing later synthetic addresses from turning
+them into unrelated labels. Real section indices and external bindings are not
+reclassified. Matching printer/layout support must honor that ELF metadata too.
+
+Edits resize blocks that span the changed bytes. A size-changing replacement
+that erases an overlapping block's interior boundary raises `AmbiguousIRError`
+before splitting the target block, rather than guessing a new boundary.
+
 ## Aux Data Tables
 
 gtirb-rewriting uses some non-standardized aux data tables for preserving
 state across rewrites.
+
+When present, `liveRegisterSets` (`mapping<Offset,uint64_t>`) follows surviving
+instruction offsets through insertions, splits, joins and deletions. New or
+replaced instructions do not inherit old masks. Register bit names remain in
+the unchanged `liveRegisterNames` table. This maintains instruction identity,
+not the validity of liveness under arbitrary register/CFG changes: clients must
+invalidate dependent masks for such changes and refresh their analysis caches
+after applying edits.
 
 | <!-- --> | <!-- -->                                                 |
 |----------|----------------------------------------------------------|

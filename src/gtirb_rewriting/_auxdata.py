@@ -250,6 +250,13 @@ elf_symbol_versions = define_table(
 
 # Provisional AuxData tables
 
+live_register_sets = define_table(
+    gtirb.Module,
+    "liveRegisterSets",
+    "mapping<Offset,uint64_t>",
+    Dict[gtirb.Offset, int],
+)
+
 binary_type = define_table(
     gtirb.Module,
     "binaryType",

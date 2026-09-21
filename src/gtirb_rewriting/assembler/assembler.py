@@ -1868,17 +1868,33 @@ class _Streamer(mcasm.Streamer):
                     expr.location or loc,
                 )
             expr = expr.sub_expr
+        offset = 0
+        scale = 1
         if (
             isinstance(expr, mcasm.mc.BinaryExpr)
-            and expr.opcode == mcasm.mc.BinaryExpr.Opcode.Add
-            and isinstance(expr.lhs, mcasm.mc.SymbolRefExpr)
+            and expr.opcode in (
+                mcasm.mc.BinaryExpr.Opcode.Add,
+                mcasm.mc.BinaryExpr.Opcode.Sub,
+            )
             and isinstance(expr.rhs, mcasm.mc.ConstantExpr)
         ):
-            sym = self._resolve_symbol_ref(expr.lhs)
-            attributes |= self._get_symbol_ref_attrs(expr.lhs, sym, is_branch)
             offset = expr.rhs.value
-            return gtirb.SymAddrConst(offset, sym, attributes)
-        elif (
+            if expr.opcode == mcasm.mc.BinaryExpr.Opcode.Sub:
+                offset = -offset
+            expr = expr.lhs
+        if (
+            isinstance(expr, mcasm.mc.BinaryExpr)
+            and expr.opcode == mcasm.mc.BinaryExpr.Opcode.Div
+            and isinstance(expr.rhs, mcasm.mc.ConstantExpr)
+        ):
+            scale = expr.rhs.value
+            if scale <= 0:
+                raise UnsupportedAssemblyError._make(
+                    "symbol difference scale must be positive",
+                    expr.location or loc,
+                )
+            expr = expr.lhs
+        if (
             isinstance(expr, mcasm.mc.BinaryExpr)
             and expr.opcode == mcasm.mc.BinaryExpr.Opcode.Sub
             and isinstance(expr.lhs, mcasm.mc.SymbolRefExpr)
@@ -1904,11 +1920,11 @@ class _Streamer(mcasm.Streamer):
                     expr.rhs.location or loc,
                 )
 
-            return gtirb.SymAddrAddr(1, 0, sym1, sym2, set())
-        elif isinstance(expr, mcasm.mc.SymbolRefExpr):
+            return gtirb.SymAddrAddr(scale, offset, sym1, sym2, attributes)
+        elif isinstance(expr, mcasm.mc.SymbolRefExpr) and scale == 1:
             sym = self._resolve_symbol_ref(expr)
             attributes |= self._get_symbol_ref_attrs(expr, sym, is_branch)
-            return gtirb.SymAddrConst(0, sym, attributes)
+            return gtirb.SymAddrConst(offset, sym, attributes)
 
         raise UnsupportedAssemblyError._make(
             "unsupported symbolic expression",

@@ -1214,6 +1214,31 @@ def test_edit_byte_interval_replace():
     }
 
 
+@pytest.mark.parametrize(
+    "offset,length,content,expected",
+    [
+        (4, 0, b"X", b"ab\x00\x00X"),
+        (4, 2, b"X", b"ab\x00\x00X"),
+        (1, 4, b"X", b"aX"),
+        (4, 2, b"", b"ab"),
+        (4, 0, b"", b"ab"),
+        (8, 0, b"X", b"ab" + b"\x00" * 6 + b"X"),
+    ],
+)
+def test_edit_byte_interval_uninitialized_tail(offset, length, content, expected):
+    _, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    section, _ = add_data_section(module)
+    interval = gtirb.ByteInterval(section=section, size=8, contents=b"ab")
+    original_contents = interval.contents
+    gtirb_rewriting._modify.edit_byte_interval(interval, offset, length, content)
+    assert interval.contents is original_contents
+    assert interval.contents == expected
+    assert interval.size == 8 + len(content) - length
+    assert interval.initialized_size == len(expected)
+
+
 def test_edit_byte_interval_normalizes_immutable_contents():
     _, m = create_test_module(
         gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
@@ -1229,3 +1254,88 @@ def test_edit_byte_interval_normalizes_immutable_contents():
     assert isinstance(bi.contents, bytearray)
     assert bi.contents == b"\x90\xCC\x90"
     assert bi.size == 3
+
+
+@pytest.mark.parametrize("block_type", [gtirb.CodeBlock, gtirb.DataBlock])
+@pytest.mark.parametrize("length,content", [(0, b"XY"), (2, b""), (2, b"WXYZ")])
+def test_edit_byte_interval_spanning_blocks(block_type, length, content):
+    _, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    _, interval = add_data_section(module, address=0x1000)
+    outer = add_data_block(interval, b"abcdefgh")
+    inner = block_type(offset=2, size=4, byte_interval=interval)
+    after = gtirb.DataBlock(offset=6, size=2, byte_interval=interval)
+    before = gtirb.DataBlock(offset=0, size=3, byte_interval=interval)
+    end_symbol = add_symbol(module, "inner_end", inner)
+    end_symbol.at_end = True
+    delta = len(content) - length
+
+    gtirb_rewriting._modify.edit_byte_interval(interval, 3, length, content)
+
+    expected = b"abc" + content + b"abcdefgh"[3 + length :]
+    assert interval.contents == expected
+    assert outer.size == 8 + delta
+    assert inner.offset == 2
+    assert inner.size == 4 + delta
+    assert inner.contents == expected[2 : 6 + delta]
+    assert after.offset == 6 + delta
+    assert after.contents == b"gh"
+    assert before.offset == 0 and before.size == 3
+    assert end_symbol.referent.address + end_symbol.referent.size == 0x1006 + delta
+
+
+@pytest.mark.parametrize("start,size", [(3, 1), (4, 2), (1, 3), (4, 0)])
+def test_edit_byte_interval_rejects_ambiguous_boundaries(start, size):
+    _, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    _, interval = add_data_section(module, address=0x1000)
+    primary = add_data_block(interval, b"abcdefgh")
+    other = gtirb.DataBlock(offset=start, size=size, byte_interval=interval)
+    symbol = add_symbol(module, "boundary", other)
+    interval.symbolic_expressions[7] = gtirb.SymAddrConst(0, symbol)
+    module.aux_data["comments"].data[gtirb.Offset(interval, 7)] = "tail"
+    original_contents = interval.contents
+
+    with pytest.raises(gtirb_rewriting._modify.AmbiguousIRError):
+        gtirb_rewriting._modify.edit_byte_interval(
+            interval, 3, 2, b"X", {primary}
+        )
+
+    assert interval.contents is original_contents
+    assert interval.contents == b"abcdefgh" and interval.size == 8
+    assert other.offset == start and other.size == size
+    assert interval.symbolic_expressions == {7: gtirb.SymAddrConst(0, symbol)}
+    assert module.aux_data["comments"].data == {gtirb.Offset(interval, 7): "tail"}
+
+
+@pytest.mark.parametrize(
+    "start,size,length,content,expected_offset,expected_size",
+    [
+        (3, 3, 0, b"X", 4, 3),
+        (3, 3, 2, b"X", 3, 2),
+        (3, 2, 2, b"", 3, 0),
+        (1, 4, 2, b"X", 1, 3),
+        (5, 2, 2, b"X", 4, 2),
+        (3, 0, 2, b"X", 3, 0),
+        (5, 0, 2, b"X", 4, 0),
+        (4, 1, 2, b"XY", 4, 1),
+    ],
+)
+def test_edit_byte_interval_boundary_extents(
+    start, size, length, content, expected_offset, expected_size
+):
+    _, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    _, interval = add_data_section(module)
+    primary = add_data_block(interval, b"abcdefgh")
+    other = gtirb.DataBlock(offset=start, size=size, byte_interval=interval)
+
+    gtirb_rewriting._modify.edit_byte_interval(
+        interval, 3, length, content, {primary}
+    )
+
+    assert (primary.offset, primary.size) == (0, 8)
+    assert (other.offset, other.size) == (expected_offset, expected_size)
