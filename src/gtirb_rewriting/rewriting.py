@@ -45,7 +45,6 @@ from typing import (
 
 import gtirb
 import gtirb_functions
-from gtirb_capstone.instructions import GtirbInstructionDecoder
 from intervaltree import IntervalTree
 
 import gtirb_rewriting._auxdata as _auxdata
@@ -60,8 +59,10 @@ from ._modify import (
     make_modify_cache,
     retarget_symbol_uses,
 )
+from ._riscv_insert import RiscvInsertionLocations
 from .abi import ABI
 from .assembler import AsmSyntaxError, Assembler
+from .decoder import GtirbInstructionDecoder
 from .patch import InsertionContext, Patch
 from .prepare import prepare_for_rewriting
 from .scopes import (
@@ -324,6 +325,7 @@ class RewritingContext:
         self._decoder = GtirbInstructionDecoder(self._module.isa)
         self._abi = ABI.get(module)
         self._modifications = _ModificationStore()
+        self._riscv_insertions = RiscvInsertionLocations()
         self._modification_id = itertools.count()
         self._function_insertions: List[_FunctionInsertion] = []
         self._symbol_retargets: Dict[gtirb.Symbol, gtirb.Symbol] = {}
@@ -1030,8 +1032,21 @@ class RewritingContext:
         except TypeError:
             block, offset, patch = unpack_old(*args, **kwargs)
 
+        block, offset = self.resolve_insert_location(block, offset)
         self._validate_offset_and_length(block, offset, 0)
         self.register_insert(_SpecificLocationScope(block, offset), patch)
+
+    def resolve_insert_location(
+        self, block: gtirb.ByteBlock, offset: int
+    ) -> Tuple[gtirb.ByteBlock, int]:
+        """Resolve an insertion boundary before allocating its registers.
+
+        RISC-V call and address-materialization pairs can require an insertion
+        to move across an instruction or into the preceding block. Clients
+        allocating registers themselves must query this same location so
+        their liveness assumptions match where the patch will execute.
+        """
+        return self._riscv_insertions.resolve(block, offset)
 
     @overload
     def replace_at(
@@ -1170,6 +1185,7 @@ class RewritingContext:
         Applies all of the patches to the module.
         """
 
+        self._riscv_insertions.clear()
         assert self._module.ir
 
         apply_started = time.perf_counter()

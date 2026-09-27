@@ -38,7 +38,7 @@ def test_target_relocations(assembly, attributes, addend):
     assembler = make_assembler()
     assembler.assemble(assembly)
     result = assembler.finalize()
-    expression, = result.text_section.symbolic_expressions.values()
+    (expression,) = result.text_section.symbolic_expressions.values()
     assert expression.symbol.name == "target"
     assert expression.offset == addend
     assert expression.attributes == attributes
@@ -48,7 +48,7 @@ def test_plt_external_and_undefined_address():
     assembler = make_assembler()
     assembler.assemble("call external@plt")
     result = assembler.finalize()
-    expr, = result.text_section.symbolic_expressions.values()
+    (expr,) = result.text_section.symbolic_expressions.values()
     assert expr.symbol.name == "external"
     assert expr.symbol.referent in result.proxies
     with pytest.raises(UndefSymbolError):
@@ -60,7 +60,7 @@ def test_direct_jump_has_no_call_or_fallthrough_edge():
     assembler.assemble("j target\nnop")
     result = assembler.finalize()
     block = result.text_section.blocks[0]
-    edge, = result.cfg.out_edges(block)
+    (edge,) = result.cfg.out_edges(block)
     assert edge.label == gtirb.Edge.Label(gtirb.Edge.Type.Branch)
 
 
@@ -69,9 +69,12 @@ def test_indirect_call_has_fallthrough():
     assembler.assemble("jalr ra,0(t0)\nnop")
     result = assembler.finalize()
     assert {edge.label.type for edge in result.cfg} == {
-        gtirb.Edge.Type.Call, gtirb.Edge.Type.Fallthrough
+        gtirb.Edge.Type.Call,
+        gtirb.Edge.Type.Fallthrough,
     }
-    edge = next(edge for edge in result.cfg if edge.label.type == gtirb.Edge.Type.Call)
+    edge = next(
+        edge for edge in result.cfg if edge.label.type == gtirb.Edge.Type.Call
+    )
     assert not edge.label.direct
 
 
@@ -83,7 +86,11 @@ def test_reused_and_independent_assemblers_keep_their_source_operands():
     first.assemble("addi t0,t0,%lo(first)")
     first_result = first.finalize()
     second_result = second.finalize()
-    assert [e.symbol.name for e in first_result.text_section.symbolic_expressions.values()] == [
-        "first", "first"
-    ]
-    assert [e.symbol.name for e in second_result.text_section.symbolic_expressions.values()] == ["second"]
+    assert [
+        e.symbol.name
+        for e in first_result.text_section.symbolic_expressions.values()
+    ] == ["first", "first"]
+    assert [
+        e.symbol.name
+        for e in second_result.text_section.symbolic_expressions.values()
+    ] == ["second"]

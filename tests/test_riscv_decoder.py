@@ -45,5 +45,5 @@ def test_rv64gc_and_link_register_details(caplog):
 
 def test_unknown_unsupported_isa_is_not_guessed_as_rv64():
     block = make_block("13000000", "RISCV32")
-    with pytest.raises(Exception):
+    with pytest.raises(KeyError):
         list(GtirbInstructionDecoder(block.module.isa).get_instructions(block))

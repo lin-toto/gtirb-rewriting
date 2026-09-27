@@ -105,11 +105,11 @@ context.register_insert(
 
 ## Disassembling Existing Code
 
-Disassembly is done via `gtirb_capstone`'s `GtirbInstructionDecoder` object,
+Disassembly is done via `gtirb_rewriting`'s `GtirbInstructionDecoder` object,
 like so:
 ```python
 # at the top of the file:
-from gtirb_capstone.instructions import GtirbInstructionDecoder
+from gtirb_rewriting.decoder import GtirbInstructionDecoder
 
 # in a Pass's begin_module callback:
 decoder = GtirbInstructionDecoder(module.isa)
