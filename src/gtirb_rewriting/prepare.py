@@ -34,7 +34,11 @@ from gtirb_layout import (
 import gtirb_rewriting._auxdata as _auxdata
 
 from ._riscv_pcrel import RiscvPcrelPairs
-from .intervalutils import join_byte_intervals, split_byte_interval
+from .intervalutils import (
+    _alignment_requirement,
+    join_byte_intervals,
+    split_byte_interval,
+)
 
 logger = logging.getLogger("gtirb_rewriting")
 
@@ -80,6 +84,56 @@ def _assign_integral_symbols(module: gtirb.Module) -> None:
                 info[symbol] = (*attributes[:4], _SHN_ABS)
 
 
+def _layout_module(module: gtirb.Module) -> None:
+    """Keep every explicit alignment when the layout dependency moves runs.
+
+    gtirb-layout 1.x uses only the first aligned block in each interval. Give
+    it the strongest compatible constraint while laying out, then restore all
+    original metadata. This preserves both the interval order/defaults chosen
+    by the dependency and the relative offsets of immutable data runs.
+    """
+    alignment = _auxdata.alignment.get(module)
+    if not alignment:
+        with _preserve_absolute_symbols(module):
+            layout_module(module)
+        return
+
+    # Validate before creating temporary nodes or changing the aux data.
+    anchors = []
+    for interval in module.byte_intervals:
+        modulus, _ = _alignment_requirement(interval, alignment)
+        aligned_blocks = [
+            block for block in interval.blocks if block in alignment
+        ]
+        if aligned_blocks:
+            block = max(aligned_blocks, key=alignment.__getitem__)
+            if alignment[block] == modulus:
+                anchors.append((interval, block, modulus))
+                continue
+        if interval in alignment:
+            anchors.append((interval, None, modulus))
+
+    auxiliary = module.aux_data[_auxdata.alignment.name]
+    reduced_alignment = {}
+    temporary_blocks = []
+    try:
+        for interval, block, modulus in anchors:
+            if block is None:
+                # The dependency ignores ByteInterval alignment entries. A
+                # temporary zero-sized anchor expresses their start residue
+                # without introducing bytes or any persistent block/symbol.
+                block = gtirb.DataBlock(byte_interval=interval)
+                temporary_blocks.append(block)
+            reduced_alignment[block] = modulus
+        auxiliary.data = reduced_alignment
+        with _preserve_absolute_symbols(module):
+            layout_module(module)
+    finally:
+        auxiliary.data = alignment
+        for block in temporary_blocks:
+            block.byte_interval = None
+
+
 def _should_log_interval(index: int, total: int) -> bool:
     return (
         total <= 20
@@ -116,8 +170,7 @@ def prepare_for_rewriting(
     pcrel_pairs = RiscvPcrelPairs(module)
     if is_module_layout_required(module):
         logger.info("prepare: laying out input module")
-        with _preserve_absolute_symbols(module):
-            layout_module(module)
+        _layout_module(module)
     logger.info(
         "prepare: input layout ready in %.1fs",
         time.perf_counter() - phase_started,
@@ -215,8 +268,7 @@ def prepare_for_rewriting(
         phase_started = time.perf_counter()
         logger.info("prepare: laying out rewritten module")
         _assign_integral_symbols(module)
-        with _preserve_absolute_symbols(module):
-            layout_module(module)
+        _layout_module(module)
         logger.info(
             "prepare: rewritten module layout complete in %.1fs",
             time.perf_counter() - phase_started,

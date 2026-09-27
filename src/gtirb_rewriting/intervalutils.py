@@ -23,7 +23,7 @@ import dataclasses
 import itertools
 import logging
 import time
-from typing import Iterable, List, Mapping, MutableMapping, Optional
+from typing import Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
 import gtirb
 
@@ -32,7 +32,6 @@ import gtirb_rewriting._auxdata as _auxdata
 from ._adt import OffsetMapping
 from ._auxdata_offsetmap import OFFSETMAP_AUX_DATA_TABLES
 from .abi import ABI
-from .utils import align_address
 
 logger = logging.getLogger("gtirb_rewriting")
 
@@ -81,7 +80,9 @@ def split_byte_interval(
     :param tables:  optional collection of offset mappings to update
     :param isolated_blocks:  optional blocks whose overlapping block groups
         should be placed in separate intervals; other consecutive groups are
-        kept together unless an alignment boundary requires a split
+        kept together unless an alignment boundary requires a split. Untouched
+        contiguous, non-overlapping data blocks stay together even across an
+        alignment boundary, so padding cannot be inserted inside a data run.
     :returns:  list of byte intervals containing the blocks in the original
         interval
     """
@@ -142,6 +143,7 @@ def split_byte_interval(
 
         coalesced_groups: List[BlockGroup] = []
         previous_is_isolated = False
+        previous_data_end = None
         for group in groups:
             group_is_isolated = any(
                 block in isolated_block_set for block in group.blocks
@@ -149,17 +151,31 @@ def split_byte_interval(
             group_starts_aligned = alignment is not None and any(
                 block in alignment for block in group.blocks
             )
+            # A block boundary is not necessarily an object boundary: an
+            # indexed table can span several DataBlocks. If none can change,
+            # align the whole run, not each of its interior pieces. Do not
+            # infer such a run across gaps, overlaps or an explicit edit.
+            immutable_data = (
+                not group_is_isolated
+                and len(group.blocks) == 1
+                and isinstance(group.blocks[0], gtirb.DataBlock)
+                and group.blocks[0].size > 0
+            )
+            continues_data_run = (
+                immutable_data and previous_data_end == group.begin
+            )
             if (
                 coalesced_groups
                 and not previous_is_isolated
                 and not group_is_isolated
-                and not group_starts_aligned
+                and (not group_starts_aligned or continues_data_run)
             ):
                 coalesced_groups[-1].end = group.end
                 coalesced_groups[-1].blocks.extend(group.blocks)
             else:
                 coalesced_groups.append(group)
             previous_is_isolated = group_is_isolated
+            previous_data_end = group.end if immutable_data else None
         groups = coalesced_groups
         if is_large:
             logger.info(
@@ -240,6 +256,36 @@ def split_byte_interval(
     return intervals
 
 
+def _alignment_requirement(
+    interval: gtirb.ByteInterval,
+    alignment: Mapping[gtirb.Node, int],
+) -> Tuple[int, int]:
+    """Return the modulus and start residue satisfying every alignment.
+
+    An interior block at offset D with alignment A requires the interval's
+    start to be -D modulo A, not necessarily zero modulo A. Power-of-two
+    constraints are compatible exactly when the strongest residue satisfies
+    each weaker one. Conflicts cannot be solved by padding before the interval.
+    """
+    modulus, residue = 1, 0
+    for node, offset in itertools.chain(
+        ((interval, 0),), ((block, block.offset) for block in interval.blocks)
+    ):
+        if node not in alignment:
+            continue
+        boundary = alignment[node]
+        if boundary <= 0 or boundary & (boundary - 1):
+            raise PaddingError("alignment must be a positive power of two")
+        required = -offset % boundary
+        if (required - residue) % min(boundary, modulus):
+            raise PaddingError(
+                "incompatible alignment requirements within a byte interval"
+            )
+        if boundary > modulus:
+            modulus, residue = boundary, required
+    return modulus, residue
+
+
 def join_byte_intervals(
     intervals: List[gtirb.ByteInterval],
     nop: Optional[bytes] = None,
@@ -254,9 +300,10 @@ def join_byte_intervals(
     concatenated onto the end of the destination interval in the order they
     appear in the list.
 
-    Padding will be inserted between subsequent intervals so that the address
-    of the first block of each interval (or of the interval itself if it
-    contains no blocks) is properly aligned. Addresses are calculated based on
+    Padding will be inserted between subsequent intervals so that all explicit
+    block and interval alignments are satisfied, without inserting padding
+    inside an interval. Incompatible alignment constraints raise PaddingError.
+    Addresses are calculated based on
     the address of the destination block, or 0 if it has no address. If the
     alignment mapping is not specified, the "alignment" aux data for each
     interval's module, if any, will be used.
@@ -294,6 +341,19 @@ def join_byte_intervals(
         nop_encodings.setdefault(gtirb.CodeBlock.DecodeMode.Default, nop)
 
     destination = intervals[0]
+    requirements = {}
+    # Check before moving any blocks: selecting only the first aligned block
+    # can silently lose a stronger alignment further inside a data run.
+    for interval in intervals[1:]:
+        if alignment is not None:
+            module_alignment = alignment
+        elif interval.module is not None:
+            module_alignment = _auxdata.alignment.get(interval.module) or {}
+        else:
+            module_alignment = {}
+        requirements[interval] = _alignment_requirement(
+            interval, module_alignment
+        )
     section_name = (
         destination.section.name if destination.section else "none"
     )
@@ -399,29 +459,8 @@ def join_byte_intervals(
         # Fill in any uninitialized bytes before appending.
         insert_padding(destination.size - len(contents))
 
-        # Align the first block if possible, or the interval if not.
-        if alignment is not None:
-            module_alignment = alignment
-        elif interval.module is not None and _auxdata.alignment.exists(
-            interval.module
-        ):
-            module_alignment = _auxdata.alignment.get_or_insert(
-                interval.module
-            )
-        else:
-            module_alignment = {}
-        node = min(
-            (b for b in interval.blocks if b in module_alignment),
-            key=lambda b: b.offset,
-            default=interval,
-        )
-        if node == interval:
-            offset = 0
-        else:
-            assert isinstance(node, gtirb.ByteBlock)
-            offset = node.offset
-        boundary = module_alignment.get(node, 1)
-        size = align_address(address + offset, boundary) - (address + offset)
+        modulus, residue = requirements[interval]
+        size = (residue - address) % modulus
         insert_padding(size)
         address += size
         destination.size += size

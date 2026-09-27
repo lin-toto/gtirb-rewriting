@@ -243,18 +243,16 @@ def test_split_byte_interval_isolates_selected_blocks():
     assert [interval.contents for interval in intervals] == [
         b"a",
         b"b",
-        b"c",
-        b"de",
+        b"cde",
     ]
     assert [interval.blocks for interval in intervals] == [
         {blocks[0]},
         {blocks[1]},
-        {blocks[2]},
-        {blocks[3], blocks[4]},
+        {blocks[2], blocks[3], blocks[4]},
     ]
-    assert intervals[3].address == 4
-    assert blocks[3].offset == 0
-    assert blocks[4].offset == 1
+    assert intervals[2].address == 3
+    assert blocks[3].offset == 1
+    assert blocks[4].offset == 2
 
 
 def test_split_byte_interval_uninitialized_contents():
