@@ -24,6 +24,7 @@ import dataclasses
 import enum
 import functools
 import itertools
+import re
 import warnings
 from collections import defaultdict
 from contextlib import contextmanager
@@ -329,7 +330,7 @@ class Assembler:
 
         assembler.assemble(_SymbolCreator(self._state), asm)
 
-        assembler.assemble(_Streamer(self._state), asm)
+        assembler.assemble(_Streamer(self._state, asm.splitlines()), asm)
 
         return not self._state.had_error
 
@@ -994,8 +995,9 @@ class _Streamer(mcasm.Streamer):
         mcasm.mc.SymbolAttr.ELF_TypeTLS: "TLS",
     }
 
-    def __init__(self, state: "_State"):
+    def __init__(self, state: "_State", source_lines: List[str]):
         self._state = state
+        self._source_lines = source_lines
         self._prevent_print_as_string_count = 0
         super().__init__()
 
@@ -1133,6 +1135,16 @@ class _Streamer(mcasm.Streamer):
         data: bytes,
         fixups: List[mcasm.mc.Fixup],
     ) -> None:
+        # LLVM describes JAL as a call even when its encoded link register is
+        # zero. In that form it is an unconditional jump, with no fallthrough.
+        riscv_jump = (
+            self._state.target.isa == gtirb.Module.ISA.ValidButUnsupported
+            and inst.name == "JAL"
+            and inst.desc.is_call
+            and not inst.desc.is_branch
+            and len(data) >= 4
+            and ((int.from_bytes(data[:4], "little") >> 7) & 0x1F) == 0
+        )
         for fixup in fixups:
             pos = len(self._state.current_section.data) + fixup.offset
             self._state.current_section.symbolic_expressions[pos] = (
@@ -1168,12 +1180,12 @@ class _Streamer(mcasm.Streamer):
                 data, inst, fixups, state.loc
             )
 
-            if inst.desc.is_call:
+            if inst.desc.is_call and not riscv_jump:
                 edge_label = gtirb.Edge.Label(
                     type=gtirb.Edge.Type.Call,
                     direct=direct,
                 )
-            elif inst.desc.is_branch:
+            elif inst.desc.is_branch or riscv_jump:
                 edge_label = gtirb.Edge.Label(
                     type=gtirb.Edge.Type.Branch,
                     conditional=inst.desc.is_conditional_branch,
@@ -1196,7 +1208,8 @@ class _Streamer(mcasm.Streamer):
             # Currently we assume that all calls can return and that they need
             # a fallthrough edge.
             add_fallthrough = (
-                inst.desc.is_call or inst.desc.is_conditional_branch
+                (inst.desc.is_call and not riscv_jump)
+                or inst.desc.is_conditional_branch
             )
             self._split_block(add_fallthrough=add_fallthrough)
 
@@ -1942,6 +1955,13 @@ class _Streamer(mcasm.Streamer):
         Converts an LLVM fixup to a GTIRB SymbolicExpression.
         """
         expr = fixup.value
+        if (
+            self._state.target.isa == gtirb.Module.ISA.ValidButUnsupported
+            and isinstance(expr, mcasm.mc.TargetExpr)
+        ):
+            result = self._riscv_fixup_to_symbolic_operand(fixup, loc)
+            if result is not None:
+                return result
 
         # LLVM will automatically add a negative value to make the expression
         # be PC-relative. We don't care about that and just want to unwrap it.
@@ -1955,6 +1975,69 @@ class _Streamer(mcasm.Streamer):
             expr = expr.lhs
 
         return self._mcexpr_to_symbolic_operand(expr, is_branch, loc)
+
+    def _riscv_fixup_to_symbolic_operand(
+        self, fixup: mcasm.mc.Fixup, loc: mcasm.mc.SourceLocation
+    ) -> Optional[gtirb.SymAddrConst]:
+        # mcasm 0.4 exposes RISC-V target expressions only as opaque
+        # TargetExpr objects (unlike its AArch64 and MIPS subclasses). Recover
+        # the operand from the source location until mcasm exposes sub_expr.
+        # Keep this source state per streamer, not global across assemblers.
+        kinds = {
+            "fixup_riscv_hi20": {compat_proto.HI},
+            "fixup_riscv_lo12_i": {compat_proto.LO},
+            "fixup_riscv_lo12_s": {compat_proto.LO},
+            "fixup_riscv_pcrel_hi20": {compat_proto.PCREL, compat_proto.HI},
+            "fixup_riscv_pcrel_lo12_i": {compat_proto.PCREL, compat_proto.LO},
+            "fixup_riscv_pcrel_lo12_s": {compat_proto.PCREL, compat_proto.LO},
+            "fixup_riscv_got_hi20": {
+                compat_proto.GOT, compat_proto.PCREL, compat_proto.HI
+            },
+            "fixup_riscv_call": set(),
+            "fixup_riscv_call_plt": {compat_proto.PLT},
+        }
+        attributes = kinds.get(fixup.kind_info.name)
+        if attributes is None:
+            return None
+        lineno = loc.lineno if loc else 0
+        if not 0 < lineno <= len(self._source_lines):
+            return None
+        search_order = [lineno - 1]
+        for distance in range(1, 5):
+            search_order.extend((lineno - 1 - distance, lineno - 1 + distance))
+        symbol_ref = None
+        for index in search_order:
+            if not 0 <= index < len(self._source_lines):
+                continue
+            line = self._source_lines[index]
+            match = re.search(r"%[A-Za-z0-9_]+\(([^)]+)\)", line)
+            if match is None:
+                match = re.search(r"\b(?:call|tail)\s+([^\s,#]+)", line)
+            if match:
+                symbol_ref = match.group(1).strip()
+                break
+        if symbol_ref is None:
+            return None
+        match = re.match(r"^(.+?)([+-](?:0x[0-9A-Fa-f]+|\d+))$", symbol_ref)
+        symbol_name = match.group(1).strip() if match else symbol_ref
+        addend = int(match.group(2), 0) if match else 0
+        if symbol_name.endswith("@plt"):
+            symbol_name = symbol_name[:-4]
+            attributes.add(compat_proto.PLT)
+        symbol = self._symbol_lookup(symbol_name)
+        if symbol is None:
+            if (
+                compat_proto.PLT not in attributes
+                and not self._state.allow_undef_symbols
+            ):
+                raise UndefSymbolError._make(
+                    f"{symbol_name} is an undefined symbol reference", loc
+                )
+            proxy = gtirb.ProxyBlock()
+            symbol = gtirb.Symbol(symbol_name, payload=proxy)
+            self._state.local_symbols[symbol_name] = symbol
+            self._state.proxies.add(proxy)
+        return gtirb.SymAddrConst(addend, symbol, attributes)
 
     def _symbol_lookup(self, name: str) -> Optional[gtirb.Symbol]:
         """

@@ -41,6 +41,7 @@ _INDIRECT_CALL_INSTRS = {
     },
     gtirb.Module.ISA.ARM64: {"BLR", "BLRAA", "BLRAAZ", "BLRAB", "BLRABZ"},
     gtirb.Module.ISA.MIPS32: {"JALR"},
+    gtirb.Module.ISA.ValidButUnsupported: {"JALR"},
 }
 
 
