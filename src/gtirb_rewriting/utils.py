@@ -25,9 +25,10 @@ from typing import Iterable, Iterator, List, Optional, Sequence, Set
 
 import gtirb
 from gtirb_capstone.capstone_compatibility import capstone
-from gtirb_capstone.instructions import GtirbInstructionDecoder
 
 import gtirb_rewriting._auxdata as _auxdata
+
+from .decoder import GtirbInstructionDecoder
 
 
 def _target_triple(
@@ -47,6 +48,12 @@ def _target_triple(
         arch = "arm64"
     elif isa == gtirb.Module.ISA.MIPS32:
         arch = "mips"
+    elif (
+        isa == gtirb.Module.ISA.ValidButUnsupported
+        and file_format == gtirb.Module.FileFormat.ELF
+    ):
+        # The current GTIRB schema represents RV64 through archInfo.
+        arch = "riscv64"
     else:
         raise NotImplementedError(f"Unsupported ISA: {isa}")
 
