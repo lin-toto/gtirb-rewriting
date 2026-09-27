@@ -821,6 +821,79 @@ def test_replace_bytes_with_trailing_zerosized_block():
     assert edges[0].source == b
 
 
+@pytest.mark.parametrize("isa", [gtirb.Module.ISA.X64, gtirb.Module.ISA.ARM64])
+@pytest.mark.parametrize("alias_offset", [None, 16, 28, "end", "after"])
+@pytest.mark.parametrize("integral", [False, True])
+def test_trailing_patch_label_with_empty_alias(isa, alias_offset, integral):
+    ir, module = create_test_module(gtirb.Module.FileFormat.ELF, isa)
+    _, interval = add_text_section(module, address=0x1000)
+    arm = isa == gtirb.Module.ISA.ARM64
+    callee = add_proxy_block(module)
+    callee_symbol = add_symbol(module, "callee", callee)
+    caller = add_code_block(
+        interval,
+        bytes.fromhex("1f2003d5") * 7 + bytes.fromhex("00000094")
+        if arm else b"\x90" * 28 + b"\xe8\0\0\0\0",
+        {28 if arm else 29: gtirb.SymAddrConst(0, callee_symbol)},
+    )
+    successor = add_code_block(
+        interval, bytes.fromhex("1f2003d5c0035fd6") if arm else b"\x90\xc3"
+    )
+    add_symbol(module, "continuation", successor)
+    add_edge(ir.cfg, caller, callee, gtirb.Edge.Type.Call)
+    add_edge(ir.cfg, caller, successor, gtirb.Edge.Type.Fallthrough)
+    if alias_offset is not None:
+        if alias_offset == "end":
+            alias_offset = caller.size
+        elif alias_offset == "after":
+            alias_offset = caller.size + (4 if arm else 1)
+        empty = (
+            interval.address + alias_offset if integral else gtirb.CodeBlock(
+                offset=alias_offset, size=0, byte_interval=interval
+            )
+        )
+        add_symbol(module, "empty_alias", empty)
+    set_all_blocks_alignment(module, 4 if arm else 1)
+
+    ctx = gtirb_rewriting.RewritingContext(module, [])
+    # Register the return marker first; both patches are applied in address
+    # order. The long prefix grows the caller across the original successor's
+    # address while prepared intervals are still separate.
+    ctx.insert_at(caller, caller.size, literal_patch(
+        "cbz x1, done; b continuation; done:"
+        if arm else "jecxz done; jmp continuation; done:"
+    ))
+    ctx.insert_at(caller, 28, literal_patch("nop\n" * 32))
+    ctx.apply()
+
+    done = next(symbol for symbol in module.symbols if symbol.name == "done")
+    assert isinstance(done.referent, gtirb.CodeBlock)
+    destination = done.referent.address
+    if done.at_end:
+        destination += done.referent.size
+    assert destination == successor.address
+    # Check the emitted branch expression and CFG as well as the label. A
+    # correctly spelled label that still branches into the caller is not safe.
+    branch_expressions = [
+        (offset, expression)
+        for offset, expression in interval.symbolic_expressions.items()
+        if isinstance(expression, gtirb.SymAddrConst)
+        and expression.symbol is done
+    ]
+    assert len(branch_expressions) == 1
+    branch_offset, expression = branch_expressions[0]
+    assert expression.offset == 0
+    source = next(
+        block for block in interval.blocks
+        if block.offset <= branch_offset < block.offset + block.size
+    )
+    assert any(
+        edge.label.type == gtirb.Edge.Type.Branch
+        and edge.target.address == destination
+        for edge in source.outgoing_edges
+    )
+
+
 def test_replace_bytes_in_place_no_symbol():
     _, m = create_test_module(
         gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64

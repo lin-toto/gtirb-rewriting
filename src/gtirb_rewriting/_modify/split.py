@@ -166,8 +166,6 @@ def split_block(
             if move:
                 cfi_data[new_block][0] = move
 
-    cache.block_ordering[block.section].insert_blocks_after(
-        block, (new_block,)
-    )
+    cache.insert_blocks_after(block, (new_block,))
 
     return block, new_block, added_fallthrough

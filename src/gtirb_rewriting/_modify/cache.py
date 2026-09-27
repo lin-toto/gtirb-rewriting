@@ -433,6 +433,34 @@ class ModifyCache:
         assert block.section
         return self.block_ordering[block.section].adjacent_blocks(block)
 
+    def insert_blocks_after(
+        self, block: gtirb.ByteBlock, new_blocks: Iterable[gtirb.ByteBlock]
+    ) -> None:
+        """Insert split or patch blocks in their interval's spatial order.
+
+        An overlapping alias may follow ``block`` in the cache but precede
+        the insertion offset. Leave those aliases before the new blocks;
+        otherwise empty-block cleanup can retarget a trailing label backward.
+        Do not compare offsets across intervals: prepared intervals retain
+        their logical ordering even while growth overlaps their addresses.
+        Patch blocks need not be attached to their destination interval yet.
+        """
+        assert block.section and block.byte_interval
+        new_blocks = tuple(new_blocks)
+        if not new_blocks:
+            return
+        ordering = self.block_ordering[block.section]
+        position = (new_blocks[0].offset, new_blocks[0].size != 0)
+        _, following = ordering.adjacent_blocks(block)
+        while (
+            following is not None
+            and following.byte_interval is block.byte_interval
+            and (following.offset, following.size != 0) < position
+        ):
+            block = following
+            _, following = ordering.adjacent_blocks(block)
+        ordering.insert_blocks_after(block, new_blocks)
+
     def in_same_function(
         self, block1: gtirb.CodeBlock, block2: gtirb.CodeBlock
     ) -> bool:

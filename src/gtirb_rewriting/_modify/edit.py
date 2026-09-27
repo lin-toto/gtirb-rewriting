@@ -308,9 +308,7 @@ def insert(
     for rel_offset, expr in text_section.symbolic_expressions.items():
         bi.symbolic_expressions[block.offset + offset + rel_offset] = expr
 
-    cache.block_ordering[block.section].insert_blocks_after(
-        block, text_section.blocks
-    )
+    cache.insert_blocks_after(block, text_section.blocks)
     bi.blocks.update(text_section.blocks)
     cfg.update(code.cfg)
     module.symbols.update(code.symbols)
