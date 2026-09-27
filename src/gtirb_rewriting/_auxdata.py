@@ -257,6 +257,13 @@ live_register_sets = define_table(
     Dict[gtirb.Offset, int],
 )
 
+live_register_sets_high = define_table(
+    gtirb.Module,
+    "liveRegisterSetsHigh",
+    "mapping<Offset,uint64_t>",
+    Dict[gtirb.Offset, int],
+)
+
 binary_type = define_table(
     gtirb.Module,
     "binaryType",

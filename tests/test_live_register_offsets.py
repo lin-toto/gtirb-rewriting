@@ -24,11 +24,17 @@ def make_module():
     _auxdata.live_register_sets.set(
         module, {gtirb.Offset(block, i): 1 << i for i in range(4)}
     )
+    _auxdata.live_register_sets_high.set(
+        module, {gtirb.Offset(block, i): (1 << i) + 100 for i in range(4)}
+    )
     return ir, module, interval, block
 
 
 def masks_by_position(module):
     result = {}
+    low = _auxdata.live_register_sets.get(module)
+    high = _auxdata.live_register_sets_high.get(module)
+    assert dict(high) == {offset: mask + 100 for offset, mask in low.items()}
     for offset, mask in _auxdata.live_register_sets.get(module).items():
         block = offset.element_id
         assert isinstance(block, gtirb.CodeBlock)

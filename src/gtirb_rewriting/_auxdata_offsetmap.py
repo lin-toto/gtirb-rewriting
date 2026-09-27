@@ -61,6 +61,7 @@ symbolic_expression_sizes = _make_offsetmap_table(
 )
 padding = _make_offsetmap_table(_auxdata.padding)
 live_register_sets = _make_offsetmap_table(_auxdata.live_register_sets)
+live_register_sets_high = _make_offsetmap_table(_auxdata.live_register_sets_high)
 
 
 # We want to erase the static type information for the values, so cast to a
@@ -73,5 +74,6 @@ OFFSETMAP_AUX_DATA_TABLES = cast(
         padding,
         symbolic_expression_sizes,
         live_register_sets,
+        live_register_sets_high,
     ),
 )
