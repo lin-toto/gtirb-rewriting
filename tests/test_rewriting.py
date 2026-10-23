@@ -894,6 +894,73 @@ def test_trailing_patch_label_with_empty_alias(isa, alias_offset, integral):
     )
 
 
+def test_empty_tail_endproc_stays_before_next_function_insertion(monkeypatch):
+    # Choose the legal equal-offset traversal that puts the empty anchor
+    # after the next function. Otherwise identity-based set order can mask
+    # the misplaced endproc.
+    def ordered(values, *, key=None, reverse=False):
+        values = list(values)
+        if values and all(isinstance(b, gtirb.ByteBlock) for b in values):
+            return sorted(values, key=lambda b: (key(b), b.size == 0),
+                          reverse=reverse)
+        return sorted(values, key=key, reverse=reverse)
+
+    monkeypatch.setattr(gtirb_rewriting.intervalutils, "sorted", ordered,
+                        raising=False)
+    ir, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    _, interval = add_text_section(module, address=0x1000)
+    callee = add_proxy_block(module)
+    callee_symbol = add_symbol(module, "noreturn_callee", callee)
+    caller = add_code_block(
+        interval, b"\xe8\0\0\0\0", {1: gtirb.SymAddrConst(0, callee_symbol)}
+    )
+    successor = add_code_block(interval, b"\xc3")
+    add_symbol(module, "successor_alias", successor)
+    anchor = gtirb.CodeBlock(
+        offset=successor.offset, size=0, byte_interval=interval
+    )
+    add_symbol(module, "instruction_anchor", anchor)
+    escape = add_proxy_block(module)
+    add_symbol(module, "escape", escape)
+    add_edge(ir.cfg, caller, callee, gtirb.Edge.Type.Call)
+    functions = [
+        add_function_object(module, "caller", caller),
+        add_function_object(module, "successor", successor),
+    ]
+    cfi = module.aux_data["cfiDirectives"].data
+    for block in (caller, successor):
+        cfi[gtirb.Offset(block, 0)] = [(".cfi_startproc", [], NULL_UUID)]
+        cfi[gtirb.Offset(block, block.size)] = [
+            (".cfi_endproc", [], NULL_UUID)
+        ]
+    set_all_blocks_alignment(module, 1)
+
+    ctx = gtirb_rewriting.RewritingContext(module, functions)
+    # The trailing label leaves an empty tail with the caller's endproc.
+    # Inserting at the next entry must not move that end past its startproc.
+    ctx.insert_at(caller, caller.size, literal_patch(
+        "jecxz .Ltail; jmp escape; .Ltail:"
+    ))
+    ctx.insert_at(successor, 0, literal_patch(
+        "jecxz .Lentry; jmp escape; .Lentry:"
+    ))
+    ctx.apply()
+
+    cfi = module.aux_data["cfiDirectives"].data
+    events = sorted(
+        (offset.element_id.address + offset.displacement, directive[0])
+        for offset, directives in cfi.items()
+        for directive in directives
+        if directive[0] in (".cfi_startproc", ".cfi_endproc")
+    )
+    assert [name for _, name in events] == [
+        ".cfi_startproc", ".cfi_endproc", ".cfi_startproc", ".cfi_endproc"
+    ]
+    assert events[1][0] == events[2][0]
+
+
 def test_replace_bytes_in_place_no_symbol():
     _, m = create_test_module(
         gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64

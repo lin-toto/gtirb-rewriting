@@ -212,7 +212,25 @@ def _remove_cfi_directives(
         cfi_table.pop(block, None)
         return
 
-    if isinstance(next_block, gtirb.CodeBlock):
+    # A closing procedure on an empty tail belongs to the preceding code.
+    # Moving it to the next block can attach it to a zero-sized instruction
+    # anchor: inserting at the next function's entry then moves that anchor
+    # (and the endproc) past the new function's startproc. Keep the closing
+    # directives at the same byte position on the nonempty predecessor.
+    if (
+        not block.size
+        and keep_directives[-1][0] == ".cfi_endproc"
+        and isinstance(prev_block, gtirb.CodeBlock)
+        and prev_block.size
+        and prev_block.byte_interval is block.byte_interval
+        and prev_block.offset + prev_block.size == block.offset
+    ):
+        prev_directives = cfi_table.setdefault(prev_block, {}).setdefault(
+            prev_block.size, []
+        )
+        prev_directives.extend(keep_directives)
+        del cfi_table[block]
+    elif isinstance(next_block, gtirb.CodeBlock):
         next_directives = cfi_table.setdefault(next_block, {}).setdefault(
             0, []
         )
