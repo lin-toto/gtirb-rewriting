@@ -55,6 +55,7 @@ from ..utils import _is_elf_pie, _is_fallthrough_edge, _target_triple
 from ._create_gtirb import create_cfi_directives as _create_cfi_directives
 from ._create_gtirb import create_gtirb as _create_gtirb
 from ._mc_utils import is_indirect_call as _is_indirect_call
+from ._mc_utils import riscv_edge_type
 
 if gtirb.version.PROTOBUF_VERSION < 4:
     import gtirb_rewriting.gtirb_protobuf_compat.proto_3 as compat_proto
@@ -1135,23 +1136,22 @@ class _Streamer(mcasm.Streamer):
         data: bytes,
         fixups: List[mcasm.mc.Fixup],
     ) -> None:
-        # LLVM describes JAL as a call even when its encoded link register is
-        # zero. In that form it is an unconditional jump, with no fallthrough.
-        riscv_jump = (
-            self._state.target.isa == gtirb.Module.ISA.ValidButUnsupported
-            and inst.name == "JAL"
-            and inst.desc.is_call
-            and not inst.desc.is_branch
-            and len(data) >= 4
-            and ((int.from_bytes(data[:4], "little") >> 7) & 0x1F) == 0
-        )
+        is_call = inst.desc.is_call
+        is_branch = inst.desc.is_branch
+        is_return = inst.desc.is_return
+        if self._state.target.isa == gtirb.Module.ISA.ValidButUnsupported:
+            edge_type = riscv_edge_type(inst)
+            if edge_type is not None:
+                is_call = edge_type == gtirb.Edge.Type.Call
+                is_branch = edge_type == gtirb.Edge.Type.Branch
+                is_return = edge_type == gtirb.Edge.Type.Return
         for fixup in fixups:
             pos = len(self._state.current_section.data) + fixup.offset
             self._state.current_section.symbolic_expressions[pos] = (
                 self._fixup_to_symbolic_operand(
                     fixup,
                     data,
-                    inst.desc.is_call or inst.desc.is_branch,
+                    is_call or is_branch,
                     state.loc,
                 )
             )
@@ -1162,7 +1162,7 @@ class _Streamer(mcasm.Streamer):
         self._append_data(data, state.loc)
         self._state.blocks_with_code.add(self._state.current_block)
 
-        if inst.desc.is_return:
+        if is_return:
             proxy = gtirb.ProxyBlock()
             self._state.proxies.add(proxy)
             self._state.cfg.add(
@@ -1175,17 +1175,17 @@ class _Streamer(mcasm.Streamer):
 
             self._split_block()
 
-        elif inst.desc.is_call or inst.desc.is_branch:
+        elif is_call or is_branch:
             direct, target = self._resolve_instruction_target(
                 data, inst, fixups, state.loc
             )
 
-            if inst.desc.is_call and not riscv_jump:
+            if is_call:
                 edge_label = gtirb.Edge.Label(
                     type=gtirb.Edge.Type.Call,
                     direct=direct,
                 )
-            elif inst.desc.is_branch or riscv_jump:
+            elif is_branch:
                 edge_label = gtirb.Edge.Label(
                     type=gtirb.Edge.Type.Branch,
                     conditional=inst.desc.is_conditional_branch,
@@ -1208,7 +1208,7 @@ class _Streamer(mcasm.Streamer):
             # Currently we assume that all calls can return and that they need
             # a fallthrough edge.
             add_fallthrough = (
-                (inst.desc.is_call and not riscv_jump)
+                is_call
                 or inst.desc.is_conditional_branch
             )
             self._split_block(add_fallthrough=add_fallthrough)

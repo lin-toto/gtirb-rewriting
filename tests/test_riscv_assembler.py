@@ -119,3 +119,26 @@ def test_opaque_macro_operand_is_rejected(prefix):
         assembler.assemble(
             prefix + ".macro load arg\n lui t0,%hi(\\arg)\n.endm\nload target"
         )
+
+
+@pytest.mark.parametrize("assembly, edge_type", [
+    ("jal zero,target", gtirb.Edge.Type.Branch),
+    ("jal t0,target", gtirb.Edge.Type.Call),
+    ("jalr zero,t1,0", gtirb.Edge.Type.Branch),
+    ("jalr zero,t0,4", gtirb.Edge.Type.Branch),
+    ("jr t1", gtirb.Edge.Type.Branch),
+    ("jr t0", gtirb.Edge.Type.Return),
+    ("ret", gtirb.Edge.Type.Return),
+    (".option rvc\nc.j target", gtirb.Edge.Type.Branch),
+    (".option rvc\nc.jr t1", gtirb.Edge.Type.Branch),
+    (".option rvc\nc.jr ra", gtirb.Edge.Type.Return),
+    (".option rvc\nc.jalr t0", gtirb.Edge.Type.Call),
+])
+def test_transfer_register_semantics(assembly, edge_type):
+    assembler = make_assembler()
+    assembler.assemble(assembly + "\nnop")
+    result = assembler.finalize()
+    expected = {edge_type}
+    if edge_type == gtirb.Edge.Type.Call:
+        expected.add(gtirb.Edge.Type.Fallthrough)
+    assert {edge.label.type for edge in result.cfg} == expected

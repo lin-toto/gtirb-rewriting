@@ -41,7 +41,7 @@ _INDIRECT_CALL_INSTRS = {
     },
     gtirb.Module.ISA.ARM64: {"BLR", "BLRAA", "BLRAAZ", "BLRAB", "BLRABZ"},
     gtirb.Module.ISA.MIPS32: {"JALR"},
-    gtirb.Module.ISA.ValidButUnsupported: {"JALR"},
+    gtirb.Module.ISA.ValidButUnsupported: {"JALR", "C_JALR"},
 }
 
 
@@ -58,3 +58,28 @@ def is_indirect_call(
     # knowledge about specific instruction forms. Plus these are _LLVM_
     # instructions, not the actual ISA's instructions.
     return inst.name in _INDIRECT_CALL_INSTRS[isa]
+
+
+def riscv_edge_type(inst: mcasm.mc.Instruction):
+    """Override LLVM transfer flags using the expanded register operands."""
+    name, operands = inst.name, inst.operands
+    if name in {"JAL", "JALR"}:
+        if operands[0].name != "X0":
+            return gtirb.Edge.Type.Call
+        if (
+            name == "JALR" and operands[1].name in {"X1", "X5"}
+            and operands[2] == 0
+        ):
+            return gtirb.Edge.Type.Return
+        return gtirb.Edge.Type.Branch
+    if name in {"C_JAL", "C_JALR"}:
+        return gtirb.Edge.Type.Call
+    if name == "C_JR":
+        return (
+            gtirb.Edge.Type.Return
+            if operands[0].name in {"X1", "X5"}
+            else gtirb.Edge.Type.Branch
+        )
+    if name == "C_J":
+        return gtirb.Edge.Type.Branch
+    return None
