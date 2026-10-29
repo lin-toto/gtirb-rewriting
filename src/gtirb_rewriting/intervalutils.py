@@ -154,12 +154,13 @@ def split_byte_interval(
             # A block boundary is not necessarily an object boundary: an
             # indexed table can span several DataBlocks. If none can change,
             # align the whole run, not each of its interior pieces. Do not
-            # infer such a run across gaps, overlaps or an explicit edit.
+            # infer such a run across gaps or an explicit edit. Untouched
+            # overlapping data aliases cover the same immutable span.
             immutable_data = (
                 not group_is_isolated
-                and len(group.blocks) == 1
-                and isinstance(group.blocks[0], gtirb.DataBlock)
-                and group.blocks[0].size > 0
+                and all(
+                    isinstance(b, gtirb.DataBlock) for b in group.blocks
+                )
             )
             continues_data_run = (
                 immutable_data and previous_data_end == group.begin

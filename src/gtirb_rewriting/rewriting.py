@@ -153,6 +153,21 @@ class _ModificationStore:
             type(modification.scope) not in (AllBlocksScope, AllFunctionsScope)
             for modification in self._scope_changes
         ):
+            # Unknown predicates must keep their post-preparation ordering.
+            # Full splitting can realign interior data boundaries; refuse when
+            # this could fragment a contiguous object instead of guessing
+            # whether the predicate will edit its data blocks.
+            for interval in module.byte_intervals:
+                data_blocks = [
+                    b for b in interval.blocks
+                    if isinstance(b, gtirb.DataBlock) and b.size
+                ]
+                starts = {b.offset for b in data_blocks}
+                if any(b.offset + b.size in starts for b in data_blocks):
+                    raise ValueError(
+                        "custom scopes cannot safely prepare contiguous data "
+                        "blocks; use explicit block targets"
+                    )
             return None
 
         blocks: Set[gtirb.ByteBlock] = set()

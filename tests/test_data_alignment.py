@@ -244,3 +244,42 @@ def test_join_rejects_invalid_alignment(boundary):
     second = gtirb.ByteInterval(contents=b"x")
     with pytest.raises(PaddingError, match="power of two"):
         join_byte_intervals([first, second], alignment={second: boundary})
+
+
+@pytest.mark.parametrize("alias_size", [0, 16])
+def test_contained_alias_preserves_untouched_data_run(alias_size):
+    module, code, head, tail = data_run(code_size=16, head_size=48)
+    alias = gtirb.DataBlock(
+        offset=head.offset + 16, size=alias_size,
+        byte_interval=head.byte_interval,
+    )
+    original_table = bytes(head.contents + tail.contents)
+    ctx = RewritingContext(module, [])
+    ctx.insert_at(code, code.size, literal_patch("nop\n" * 16))
+    ctx.apply()
+    assert head.address + head.size == tail.address
+    assert alias.address == head.address + 16
+    assert bytes(
+        head.byte_interval.contents[
+            head.offset : head.offset + len(original_table)
+        ]
+    ) == original_table
+
+
+def test_custom_scope_refuses_unproven_data_run_preparation():
+    from gtirb_rewriting import AllBlocksScope, BlockPosition
+
+    module, code, head, tail = data_run(code_size=16, head_size=48)
+
+    class OnlyCode(AllBlocksScope):
+        def _block_matches(self, module, func, block):
+            return block is code
+
+    original_bytes = bytes(code.byte_interval.contents)
+    original_addresses = (code.address, head.address, tail.address)
+    ctx = RewritingContext(module, [])
+    ctx.register_insert(OnlyCode(BlockPosition.EXIT), literal_patch("nop"))
+    with pytest.raises(ValueError, match="custom scopes.*contiguous data"):
+        ctx.apply()
+    assert bytes(code.byte_interval.contents) == original_bytes
+    assert (code.address, head.address, tail.address) == original_addresses
