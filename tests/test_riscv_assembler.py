@@ -94,3 +94,28 @@ def test_reused_and_independent_assemblers_keep_their_source_operands():
         e.symbol.name
         for e in second_result.text_section.symbolic_expressions.values()
     ] == ["second"]
+
+
+@pytest.mark.parametrize("assembly, names, offsets", [
+    ("call target@plt # %lo(decoy)", ["target"], [0]),
+    ("lui t0,%hi(first); lui t1,%hi(second)",
+     ["first", "second"], [0, 0]),
+    ("lui t0,%hi(target + 24)", ["target"], [24]),
+])
+def test_source_recovery_uses_current_statement(assembly, names, offsets):
+    assembler = make_assembler(allow_undef_symbols=True)
+    assembler.assemble(assembly)
+    section = assembler.finalize().text_section
+    expressions = list(section.symbolic_expressions.values())
+    assert [expr.symbol.name for expr in expressions] == names
+    assert [expr.offset for expr in expressions] == offsets
+
+
+@pytest.mark.parametrize("prefix", ["", "lui t1,%hi(other); "])
+def test_opaque_macro_operand_is_rejected(prefix):
+    from gtirb_rewriting import UnsupportedAssemblyError
+    assembler = make_assembler(allow_undef_symbols=True)
+    with pytest.raises(UnsupportedAssemblyError):
+        assembler.assemble(
+            prefix + ".macro load arg\n lui t0,%hi(\\arg)\n.endm\nload target"
+        )

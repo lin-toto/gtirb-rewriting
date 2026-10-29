@@ -2002,27 +2002,40 @@ class _Streamer(mcasm.Streamer):
         lineno = loc.lineno if loc else 0
         if not 0 < lineno <= len(self._source_lines):
             return None
-        search_order = [lineno - 1]
-        for distance in range(1, 5):
-            search_order.extend((lineno - 1 - distance, lineno - 1 + distance))
-        symbol_ref = None
-        for index in search_order:
-            if not 0 <= index < len(self._source_lines):
-                continue
-            line = self._source_lines[index]
-            match = re.search(r"%[A-Za-z0-9_]+\(([^)]+)\)", line)
-            if match is None:
-                match = re.search(r"\b(?:call|tail)\s+([^\s,#]+)", line)
-            if match:
-                symbol_ref = match.group(1).strip()
-                break
-        if symbol_ref is None:
-            return None
-        match = re.match(r"^(.+?)([+-](?:0x[0-9A-Fa-f]+|\d+))$", symbol_ref)
-        symbol_name = match.group(1).strip() if match else symbol_ref
-        addend = int(match.group(2), 0) if match else 0
-        if symbol_name.endswith("@plt"):
-            symbol_name = symbol_name[:-4]
+        # Expanded macro/repetition buffers have locations relative to their
+        # own buffer, which mcasm does not expose. Never interpret those as
+        # positions in the original source, or search neighboring instructions.
+        if any(re.search(r"\.(?:macro|rept|irp|irpc|include)\b", line)
+               for line in self._source_lines):
+            raise UnsupportedAssemblyError._make(
+                "cannot recover opaque RISC-V operands in expanded source", loc
+            )
+        statement = self._source_lines[lineno - 1][loc.offset - 1:]
+        statement = statement.split("#", 1)[0].split(";", 1)[0]
+        if "/*" in statement or "//" in statement:
+            raise UnsupportedAssemblyError._make(
+                "ambiguous RISC-V source operand", loc
+            )
+        matches = re.findall(r"%[A-Za-z0-9_]+\(([^)]+)\)", statement)
+        if not matches:
+            matches = re.findall(r"^\s*(?:call|tail)\s+(.+?)\s*$", statement)
+        if len(matches) != 1:
+            raise UnsupportedAssemblyError._make(
+                "cannot recover RISC-V source operand", loc
+            )
+        match = re.fullmatch(
+            r"\s*([A-Za-z_.$][\w.$]*)(@plt)?"
+            r"(?:\s*([+-])\s*(0x[0-9A-Fa-f]+|\d+))?\s*", matches[0]
+        )
+        if match is None:
+            raise UnsupportedAssemblyError._make(
+                "unsupported RISC-V source operand", loc
+            )
+        symbol_name = match.group(1)
+        addend = int(match.group(4), 0) if match.group(4) else 0
+        if match.group(3) == "-":
+            addend = -addend
+        if match.group(2):
             attributes.add(compat_proto.PLT)
         symbol = self._symbol_lookup(symbol_name)
         if symbol is None:
