@@ -589,6 +589,18 @@ def edit_byte_interval(
             b.offset += size_delta
         elif b.offset + b.size > offset:
             b.size += size_delta
+            if size_delta and isinstance(b, gtirb.CodeBlock):
+                # This alias was not split around the patch. Its instruction
+                # boundaries may differ from the edited block's, so discard
+                # its liveness instead of retaining facts at stale offsets.
+                # Missing facts conservatively mean all registers are live.
+                for table_def in (
+                    _auxdata_offsetmap.live_register_sets,
+                    _auxdata_offsetmap.live_register_sets_high,
+                ):
+                    table_data = table_def.get(bi.module)
+                    if table_data is not None:
+                        table_data.pop(b, None)
 
     # adjust sym exprs that occur after the insertion point
     bi.symbolic_expressions = {

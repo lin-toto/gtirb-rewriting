@@ -105,3 +105,30 @@ def test_live_register_delete_whole_block():
     ctx.delete_at(block, 0, block.size)
     ctx.apply()
     assert masks_by_position(module) == {}
+
+
+def test_resized_overlapping_aliases_invalidate_liveness():
+    _, module, interval, primary = make_module()
+    aliases = [
+        gtirb.CodeBlock(offset=0, size=4, byte_interval=interval),
+        gtirb.CodeBlock(offset=1, size=3, byte_interval=interval),
+    ]
+    for table in (_auxdata.live_register_sets, _auxdata.live_register_sets_high):
+        facts = table.get(module)
+        for alias in aliases:
+            facts[gtirb.Offset(alias, 0)] = 7
+            facts[gtirb.Offset(alias, alias.size - 1)] = 8
+
+    ctx = RewritingContext(module, [])
+    ctx.insert_at(primary, 2, literal_patch("nop"))
+    ctx.apply()
+
+    assert [bytes(alias.contents) for alias in aliases] == [
+        b"\x90\x90\x90\x90\xc3", b"\x90\x90\x90\xc3",
+    ]
+    for table in (_auxdata.live_register_sets, _auxdata.live_register_sets_high):
+        # Missing alias facts tell the consumer to assume every register live.
+        assert all(
+            offset.element_id not in aliases for offset in table.get(module)
+        )
+    assert masks_by_position(module) == {0: 1, 1: 2, 3: 4, 4: 8}
