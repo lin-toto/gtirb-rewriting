@@ -1952,3 +1952,58 @@ def test_layout_after():
     rwc.apply()
 
     assert not gtirb_layout.is_module_layout_required(m)
+
+
+@pytest.mark.parametrize("empty_first", [False, True])
+def test_cfi_removal_across_contiguous_intervals(monkeypatch, empty_first):
+    def ordered(values, *, key=None, reverse=False):
+        values = list(values)
+        if values and all(isinstance(b, gtirb.ByteBlock) for b in values):
+            return sorted(
+                values,
+                key=lambda b: (key(b), (b.size != 0) == empty_first),
+                reverse=reverse,
+            )
+        return sorted(values, key=key, reverse=reverse)
+
+    monkeypatch.setattr(
+        gtirb_rewriting.rewriting, "sorted", ordered, raising=False
+    )
+    _, module = create_test_module(
+        gtirb.Module.FileFormat.ELF, gtirb.Module.ISA.X64
+    )
+    section, interval = add_text_section(module, address=0x1000)
+    caller = add_code_block(interval, b"\x90")
+    tail_interval = gtirb.ByteInterval(address=0x1001, section=section)
+    tail = gtirb.CodeBlock(size=0, byte_interval=tail_interval)
+    next_interval = gtirb.ByteInterval(
+        address=0x1001, contents=b"\xc3", section=section
+    )
+    successor = gtirb.CodeBlock(size=1, byte_interval=next_interval)
+    functions = [
+        add_function_object(module, "caller", caller, {tail}),
+        add_function_object(module, "successor", successor),
+    ]
+    cfi = module.aux_data["cfiDirectives"].data
+    for block in (caller, successor):
+        cfi[gtirb.Offset(block, 0)] = [(".cfi_startproc", [], NULL_UUID)]
+    cfi[gtirb.Offset(tail, 0)] = [(".cfi_endproc", [], NULL_UUID)]
+    cfi[gtirb.Offset(successor, 1)] = [(".cfi_endproc", [], NULL_UUID)]
+    set_all_blocks_alignment(module, 1)
+
+    ctx = gtirb_rewriting.RewritingContext(module, functions)
+    ctx.delete_at(tail, 0, 0)
+    ctx.insert_at(successor, 0, literal_patch("nop"))
+    ctx.apply()
+
+    cfi = module.aux_data["cfiDirectives"].data
+    events = sorted(
+        (offset.element_id.address + offset.displacement, directive[0])
+        for offset, directives in cfi.items()
+        for directive in directives
+        if directive[0] in (".cfi_startproc", ".cfi_endproc")
+    )
+    # Balanced CFI alone is insufficient: the inserted instruction must
+    # belong to the successor's procedure under either traversal.
+    assert events[1] == (caller.address + caller.size, ".cfi_endproc")
+    assert events[2] == (successor.address, ".cfi_startproc")

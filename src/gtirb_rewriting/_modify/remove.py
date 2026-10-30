@@ -190,6 +190,7 @@ def _required_cfi_directives(
 
 
 def _remove_cfi_directives(
+    cache: ModifyCache,
     block: gtirb.ByteBlock,
     keep_directives: List[_auxdata.CFIDirectiveType],
     prev_block: Optional[gtirb.ByteBlock],
@@ -217,13 +218,24 @@ def _remove_cfi_directives(
     # anchor: inserting at the next function's entry then moves that anchor
     # (and the endproc) past the new function's startproc. Keep the closing
     # directives at the same byte position on the nonempty predecessor.
+    # Across intervals, use logical adjacency and function identity: prepared
+    # intervals may temporarily overlap after insertions, so their current
+    # addresses cannot establish procedure ownership.
     if (
         not block.size
         and keep_directives[-1][0] == ".cfi_endproc"
         and isinstance(prev_block, gtirb.CodeBlock)
         and prev_block.size
-        and prev_block.byte_interval is block.byte_interval
-        and prev_block.offset + prev_block.size == block.offset
+        and (
+            (
+                prev_block.byte_interval is block.byte_interval
+                and prev_block.offset + prev_block.size == block.offset
+            )
+            or (
+                isinstance(block, gtirb.CodeBlock)
+                and cache.in_same_function(prev_block, block)
+            )
+        )
     ):
         prev_directives = cfi_table.setdefault(prev_block, {}).setdefault(
             prev_block.size, []
@@ -411,6 +423,9 @@ def remove_block(
         cfi_directives,
     )
 
+    # Resolve CFI ownership before removing the block's function membership.
+    _remove_cfi_directives(cache, block, cfi_directives, prev_block, next_block)
+
     if can_remove:
         sym_target = proxy_block or next_block or prev_block
         cache.reference_cache.retarget_references(
@@ -438,8 +453,6 @@ def remove_block(
     _remove_outgoing_edges(cache, block)
 
     _remove_aux_data_entries(block)
-
-    _remove_cfi_directives(block, cfi_directives, prev_block, next_block)
 
     if can_remove:
         cache.block_ordering[block.section].remove_block(block)
