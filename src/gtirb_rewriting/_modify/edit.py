@@ -589,10 +589,10 @@ def edit_byte_interval(
             b.offset += size_delta
         elif b.offset + b.size > offset:
             b.size += size_delta
-            if size_delta and isinstance(b, gtirb.CodeBlock):
+            if (length or content) and isinstance(b, gtirb.CodeBlock):
                 # This alias was not split around the patch. Its instruction
-                # boundaries may differ from the edited block's, so discard
-                # its liveness instead of retaining facts at stale offsets.
+                # boundaries or register dependencies may have changed even
+                # when the replacement has the same size, so discard its facts.
                 # Missing facts conservatively mean all registers are live.
                 for table_def in (
                     _auxdata_offsetmap.live_register_sets,

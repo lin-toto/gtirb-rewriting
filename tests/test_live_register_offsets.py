@@ -132,3 +132,30 @@ def test_resized_overlapping_aliases_invalidate_liveness():
             offset.element_id not in aliases for offset in table.get(module)
         )
     assert masks_by_position(module) == {0: 1, 1: 2, 3: 4, 4: 8}
+
+
+def test_same_size_replacement_invalidates_overlapping_alias_liveness():
+    _, module, interval, primary = make_module()
+    aliases = [
+        gtirb.CodeBlock(offset=0, size=4, byte_interval=interval),
+        gtirb.CodeBlock(offset=1, size=3, byte_interval=interval),
+    ]
+    for table in (_auxdata.live_register_sets, _auxdata.live_register_sets_high):
+        facts = table.get(module)
+        for alias in aliases:
+            facts[gtirb.Offset(alias, 0)] = 7
+            facts[gtirb.Offset(alias, alias.size - 1)] = 8
+
+    ctx = RewritingContext(module, [])
+    ctx.replace_at(primary, 1, 2, literal_patch("xorl %eax, %eax"))
+    ctx.apply()
+
+    assert interval.size == 4
+    assert [bytes(alias.contents) for alias in aliases] == [
+        b"\x90\x31\xc0\xc3", b"\x31\xc0\xc3",
+    ]
+    for table in (_auxdata.live_register_sets, _auxdata.live_register_sets_high):
+        assert all(
+            offset.element_id not in aliases for offset in table.get(module)
+        )
+    assert masks_by_position(module) == {0: 1, 3: 8}
